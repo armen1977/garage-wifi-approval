@@ -1,0 +1,4 @@
+.gocache/
+.gotmp/
+*.exe
+approval-*.jsonl
