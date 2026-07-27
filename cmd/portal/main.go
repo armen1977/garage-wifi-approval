@@ -12,8 +12,10 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -28,7 +30,15 @@ type config struct {
 	GrantMinutes                                                                     int
 	RequestTTL                                                                       time.Duration
 	AdminUser, AdminPassword, LogPath                                                string
+	BackupFTPURL, BackupFTPUser, BackupFTPPass, BackupRemoteDir                      string
 	AdminCIDR                                                                        *net.IPNet
+}
+
+type backupStatus struct {
+	Configured     bool   `json:"configured"`
+	LastAttemptUTC string `json:"last_attempt_utc,omitempty"`
+	LastSuccessUTC string `json:"last_success_utc,omitempty"`
+	LastError      string `json:"last_error,omitempty"`
 }
 
 type request struct {
@@ -38,10 +48,12 @@ type request struct {
 }
 
 type app struct {
-	cfg     config
-	router  client
-	mu      sync.Mutex
-	pending map[string]request
+	cfg      config
+	router   client
+	mu       sync.Mutex
+	pending  map[string]request
+	backupMu sync.RWMutex
+	backup   backupStatus
 }
 
 type client struct {
@@ -54,8 +66,10 @@ var macRE = regexp.MustCompile(`^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$`)
 func main() {
 	a := newApp()
 	go a.cleanup()
+	go a.backupLoop()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", a.health)
+	mux.HandleFunc("/backup/status", a.backupStatus)
 	mux.HandleFunc("/", a.home)
 	mux.HandleFunc("/request", a.request)
 	mux.HandleFunc("/status", a.status)
@@ -72,12 +86,15 @@ func newApp() *app {
 		HotspotServer: env("HOTSPOT_SERVER", "hotspot-guest"), GuestRateLimit: env("GUEST_RATE_LIMIT", "5M/20M"),
 		GrantMinutes: num("GRANT_MINUTES", 60), RequestTTL: time.Duration(num("REQUEST_TTL_SECONDS", 600)) * time.Second,
 		AdminUser: env("ADMIN_USER", "master"), AdminPassword: env("ADMIN_PASSWORD", ""), AdminCIDR: cidr,
-		LogPath: env("LOG_PATH", "/data/approval.log"),
+		LogPath:      env("LOG_PATH", "/data/approval.log"),
+		BackupFTPURL: strings.TrimRight(env("BACKUP_FTP_URL", ""), "/"), BackupFTPUser: env("BACKUP_FTP_USER", "admin"),
+		BackupFTPPass: os.Getenv("BACKUP_FTP_PASSWORD"), BackupRemoteDir: env("BACKUP_REMOTE_DIR", "Garage-WiFi-Logs"),
 	}
 	return &app{
 		cfg:     cfg,
 		router:  client{base: cfg.GarageURL, user: cfg.GarageUser, pass: cfg.GaragePassword, http: &http.Client{Timeout: 12 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}},
 		pending: map[string]request{},
+		backup:  backupStatus{Configured: cfg.BackupFTPURL != ""},
 	}
 }
 
@@ -99,6 +116,15 @@ func num(key string, fallback int) int {
 func (a *app) health(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 	_, _ = w.Write([]byte("OK"))
+}
+
+func (a *app) backupStatus(w http.ResponseWriter, _ *http.Request) {
+	a.backupMu.RLock()
+	status := a.backup
+	a.backupMu.RUnlock()
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(status)
 }
 
 func (a *app) home(w http.ResponseWriter, r *http.Request) {
@@ -335,6 +361,192 @@ func (a *app) cleanupOnce() {
 	}
 }
 
+func (a *app) backupLoop() {
+	if a.cfg.BackupFTPURL == "" {
+		return
+	}
+	a.attemptBackup()
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for range ticker.C {
+		a.attemptBackup()
+	}
+}
+
+func (a *app) attemptBackup() {
+	a.backupMu.Lock()
+	a.backup.LastAttemptUTC = time.Now().UTC().Format(time.RFC3339)
+	a.backup.LastError = ""
+	a.backupMu.Unlock()
+
+	err := a.backupApprovalLog()
+	a.backupMu.Lock()
+	defer a.backupMu.Unlock()
+	if err != nil {
+		a.backup.LastError = err.Error()
+		log.Printf("approval log backup: %v", err)
+		return
+	}
+	a.backup.LastSuccessUTC = time.Now().UTC().Format(time.RFC3339)
+}
+
+func (a *app) backupApprovalLog() error {
+	name := "approval-" + time.Now().UTC().Format("2006-01") + ".jsonl"
+	contents, err := os.ReadFile(filepath.Join(filepath.Dir(a.cfg.LogPath), name))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	conn, err := connectFTP(a.cfg.BackupFTPURL, a.cfg.BackupFTPUser, a.cfg.BackupFTPPass, a.cfg.BackupRemoteDir)
+	if err != nil {
+		return err
+	}
+	defer conn.quit()
+	return conn.upload(name, contents)
+}
+
+type ftpConn struct {
+	control *textproto.Conn
+	host    string
+}
+
+func connectFTP(rawURL, username, password, remoteDir string) (*ftpConn, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	if parsed.Scheme != "ftp" || parsed.Host == "" {
+		return nil, errors.New("BACKUP_FTP_URL must be ftp://host[:port]")
+	}
+	host := parsed.Host
+	if parsed.Port() == "" {
+		host = net.JoinHostPort(parsed.Hostname(), "21")
+	}
+	raw, err := net.DialTimeout("tcp", host, 20*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	conn := &ftpConn{control: textproto.NewConn(raw), host: host}
+	if _, _, err := conn.control.ReadResponse(220); err != nil {
+		raw.Close()
+		return nil, err
+	}
+	if err := conn.control.PrintfLine("USER %s", username); err != nil {
+		raw.Close()
+		return nil, err
+	}
+	if _, _, err := conn.control.ReadResponse(230); err != nil {
+		responseErr, ok := err.(*textproto.Error)
+		if !ok || responseErr.Code != 331 {
+			raw.Close()
+			return nil, err
+		}
+		if _, err := conn.command([]int{230}, "PASS %s", password); err != nil {
+			raw.Close()
+			return nil, err
+		}
+	}
+	if _, err := conn.command([]int{200}, "TYPE I"); err != nil {
+		raw.Close()
+		return nil, err
+	}
+	dir := pathpkg.Base(strings.Trim(strings.TrimSpace(remoteDir), "/"))
+	if dir == "" || dir == "." || dir == "/" {
+		dir = "Garage-WiFi-Logs"
+	}
+	if _, err := conn.command([]int{250}, "CWD %s", dir); err != nil {
+		if _, err := conn.command([]int{257, 250}, "MKD %s", dir); err != nil {
+			_ = conn.quit()
+			return nil, err
+		}
+		if _, err := conn.command([]int{250}, "CWD %s", dir); err != nil {
+			_ = conn.quit()
+			return nil, err
+		}
+	}
+	return conn, nil
+}
+
+func (c *ftpConn) command(expect []int, format string, args ...any) (string, error) {
+	if err := c.control.PrintfLine(format, args...); err != nil {
+		return "", err
+	}
+	_, message, err := c.control.ReadResponse(expect[0])
+	if err == nil {
+		return message, nil
+	}
+	responseErr, ok := err.(*textproto.Error)
+	if !ok {
+		return "", err
+	}
+	for _, code := range expect[1:] {
+		if responseErr.Code == code {
+			return responseErr.Msg, nil
+		}
+	}
+	return "", err
+}
+
+func (c *ftpConn) upload(name string, contents []byte) error {
+	response, err := c.command([]int{229}, "EPSV")
+	if err != nil {
+		return err
+	}
+	match := regexp.MustCompile(`\(\|\|\|([0-9]+)\|\)`).FindStringSubmatch(response)
+	if len(match) != 2 {
+		return fmt.Errorf("invalid EPSV response %q", response)
+	}
+	host, _, err := net.SplitHostPort(c.host)
+	if err != nil {
+		return err
+	}
+	data, err := net.DialTimeout("tcp", net.JoinHostPort(host, match[1]), 20*time.Second)
+	if err != nil {
+		return err
+	}
+	if _, err := c.command([]int{125, 150}, "STOR %s", name); err != nil {
+		data.Close()
+		return err
+	}
+	if _, err := data.Write(contents); err != nil {
+		data.Close()
+		return err
+	}
+	if err := data.Close(); err != nil {
+		return err
+	}
+	_, err = c.readResponse([]int{226, 250})
+	return err
+}
+
+func (c *ftpConn) readResponse(expect []int) (string, error) {
+	_, message, err := c.control.ReadResponse(expect[0])
+	if err == nil {
+		return message, nil
+	}
+	responseErr, ok := err.(*textproto.Error)
+	if !ok {
+		return "", err
+	}
+	for _, code := range expect[1:] {
+		if responseErr.Code == code {
+			return responseErr.Msg, nil
+		}
+	}
+	return "", err
+}
+
+func (c *ftpConn) quit() error {
+	_, err := c.command([]int{221}, "QUIT")
+	closeErr := c.control.Close()
+	if err != nil {
+		return err
+	}
+	return closeErr
+}
+
 func (a *app) cleanupExpiredGrants(now int64) error {
 	if a.cfg.GaragePassword == "" {
 		return nil
@@ -497,4 +709,3 @@ func (a *app) page(w http.ResponseWriter, title, body string) {
 }
 
 var _ = io.EOF
-
