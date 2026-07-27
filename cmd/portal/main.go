@@ -62,70 +62,7 @@ type client struct {
 }
 
 var (
-	macRE          = regexp.MustCompile(`^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}package main
-
-import (
-	"bytes"
-	"crypto/rand"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"html"
-	"io"
-	"log"
-	"math/big"
-	"net"
-	"net/http"
-	"net/textproto"
-	"net/url"
-	"os"
-	pathpkg "path"
-	"path/filepath"
-	"regexp"
-	"sort"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
-)
-
-type config struct {
-	ListenAddr, GarageURL, GarageUser, GaragePassword, HotspotServer, GuestRateLimit string
-	GrantMinutes                                                                     int
-	RequestTTL                                                                       time.Duration
-	AdminUser, AdminPassword, LogPath                                                string
-	BackupFTPURL, BackupFTPUser, BackupFTPPass, BackupRemoteDir                      string
-	AdminCIDR                                                                        *net.IPNet
-}
-
-type backupStatus struct {
-	Configured     bool   `json:"configured"`
-	LastAttemptUTC string `json:"last_attempt_utc,omitempty"`
-	LastSuccessUTC string `json:"last_success_utc,omitempty"`
-	LastError      string `json:"last_error,omitempty"`
-}
-
-type request struct {
-	ID, ClientIP, MAC        string
-	CreatedAt, ExpiresAt     time.Time
-	ApprovedAt, GrantedUntil time.Time
-}
-
-type app struct {
-	cfg      config
-	router   client
-	mu       sync.Mutex
-	pending  map[string]request
-	backupMu sync.RWMutex
-	backup   backupStatus
-}
-
-type client struct {
-	base, user, pass string
-	http             *http.Client
-}
-
-)
+	macRE          = regexp.MustCompile(`^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$`)
 	moscowLocation = time.FixedZone("Europe/Moscow", 3*60*60)
 )
 
