@@ -61,7 +61,73 @@ type client struct {
 	http             *http.Client
 }
 
-var macRE = regexp.MustCompile(`^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$`)
+var (
+	macRE          = regexp.MustCompile(`^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}package main
+
+import (
+	"bytes"
+	"crypto/rand"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"html"
+	"io"
+	"log"
+	"math/big"
+	"net"
+	"net/http"
+	"net/textproto"
+	"net/url"
+	"os"
+	pathpkg "path"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+type config struct {
+	ListenAddr, GarageURL, GarageUser, GaragePassword, HotspotServer, GuestRateLimit string
+	GrantMinutes                                                                     int
+	RequestTTL                                                                       time.Duration
+	AdminUser, AdminPassword, LogPath                                                string
+	BackupFTPURL, BackupFTPUser, BackupFTPPass, BackupRemoteDir                      string
+	AdminCIDR                                                                        *net.IPNet
+}
+
+type backupStatus struct {
+	Configured     bool   `json:"configured"`
+	LastAttemptUTC string `json:"last_attempt_utc,omitempty"`
+	LastSuccessUTC string `json:"last_success_utc,omitempty"`
+	LastError      string `json:"last_error,omitempty"`
+}
+
+type request struct {
+	ID, ClientIP, MAC        string
+	CreatedAt, ExpiresAt     time.Time
+	ApprovedAt, GrantedUntil time.Time
+}
+
+type app struct {
+	cfg      config
+	router   client
+	mu       sync.Mutex
+	pending  map[string]request
+	backupMu sync.RWMutex
+	backup   backupStatus
+}
+
+type client struct {
+	base, user, pass string
+	http             *http.Client
+}
+
+)
+	moscowLocation = time.FixedZone("Europe/Moscow", 3*60*60)
+)
 
 func main() {
 	a := newApp()
@@ -200,7 +266,7 @@ func (a *app) status(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if active {
-			a.page(w, "Доступ открыт", fmt.Sprintf(`<h1>Доступ открыт</h1><p>Мастер подтвердил заявку. Доступ действует до %s.</p>`, req.GrantedUntil.Local().Format("15:04")))
+			a.page(w, "Доступ открыт", fmt.Sprintf(`<h1>Доступ открыт</h1><p>Мастер подтвердил заявку. Доступ действует до %s.</p>`, displayMoscowTime(req.GrantedUntil)))
 			return
 		}
 		a.page(w, "Доступ завершён", `<h1>Доступ завершён</h1><p>Время доступа истекло. Отправьте новую заявку мастеру.</p>`)
@@ -696,6 +762,11 @@ func (a *app) logEvent(fields map[string]any) {
 	}
 	defer file.Close()
 	_, _ = file.Write(append(line, '\n'))
+}
+
+// User-facing access times are always Moscow time; audit timestamps remain UTC.
+func displayMoscowTime(value time.Time) string {
+	return value.In(moscowLocation).Format("15:04")
 }
 
 func (a *app) errorPage(w http.ResponseWriter, message string) {
