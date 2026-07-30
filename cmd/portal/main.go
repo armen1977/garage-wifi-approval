@@ -280,6 +280,7 @@ func (a *app) approve(w http.ResponseWriter, r *http.Request) {
 	a.mu.Unlock()
 	operator, _, _ := r.BasicAuth()
 	a.logEvent(map[string]any{"type": "access_granted", "request_id": id, "client_ip": req.ClientIP, "mac": req.MAC, "order_ref": orderRef, "operator": operator, "expires_utc": until.Format(time.RFC3339), "expires_unix": until.Unix()})
+	go a.expireGrant(req, until)
 	a.page(w, "Готово", fmt.Sprintf("<h1>Готово</h1><p>Доступ открыт на %d минут.</p>", a.cfg.GrantMinutes))
 }
 
@@ -610,6 +611,56 @@ func (a *app) revokeLocalAuth(mac string) error {
 			itemMAC, _ := item["mac-address"].(string)
 			comment, _ := item["comment"].(string)
 			return strings.EqualFold(itemMAC, mac) && strings.HasPrefix(comment, "local-auth expires=")
+		}},
+	} {
+		var items []map[string]any
+		if err := a.router.get(target.path, &items); err != nil {
+			return fmt.Errorf("list %s: %w", target.path, err)
+		}
+		for _, item := range items {
+			if !target.match(item) {
+				continue
+			}
+			id, ok := item[".id"].(string)
+			if !ok || id == "" {
+				continue
+			}
+			if err := a.router.delete(target.path + "/" + url.PathEscape(id)); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("delete %s: %w", target.path, err)
+			}
+		}
+	}
+	return firstErr
+}
+
+func (a *app) expireGrant(req request, until time.Time) {
+	delay := time.Until(until)
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	if err := a.revokeGrantAt(req.MAC, until.Unix()); err != nil {
+		a.logEvent(map[string]any{"type": "access_expiry_error", "client_ip": req.ClientIP, "mac": req.MAC, "expires_unix": until.Unix(), "error": err.Error()})
+		return
+	}
+	a.logEvent(map[string]any{"type": "access_expired", "client_ip": req.ClientIP, "mac": req.MAC, "expires_unix": until.Unix()})
+}
+
+func (a *app) revokeGrantAt(mac string, expiresUnix int64) error {
+	compactMAC := strings.ReplaceAll(strings.ToLower(mac), ":", "")
+	var firstErr error
+	for _, target := range []struct {
+		path string
+		match func(map[string]any) bool
+	}{
+		{path: "/queue/simple", match: func(item map[string]any) bool {
+			name, _ := item["name"].(string)
+			until, ok := localAuthExpiry(item)
+			return name == "local-auth-"+compactMAC && ok && until == expiresUnix
+		}},
+		{path: "/ip/hotspot/ip-binding", match: func(item map[string]any) bool {
+			itemMAC, _ := item["mac-address"].(string)
+			until, ok := localAuthExpiry(item)
+			return strings.EqualFold(itemMAC, mac) && ok && until == expiresUnix
 		}},
 	} {
 		var items []map[string]any
