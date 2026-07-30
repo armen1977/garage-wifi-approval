@@ -341,17 +341,22 @@ func (a *app) authorizeAdmin(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func (a *app) cleanup() {
-	a.cleanupOnce()
+	// Reconcile any access left behind by a container or router restart.
+	if err := a.cleanupExpiredGrants(time.Now().UTC().Unix()); err != nil {
+		log.Printf("startup local-auth cleanup: %v", err)
+	}
+	a.cleanupPending()
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
-		a.cleanupOnce()
+		a.cleanupPending()
 	}
 }
 
-func (a *app) cleanupOnce() {
+func (a *app) cleanupPending() {
 	now := time.Now().UTC()
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	for id, req := range a.pending {
 		if req.ApprovedAt.IsZero() && now.After(req.ExpiresAt) {
 			delete(a.pending, id)
@@ -361,10 +366,6 @@ func (a *app) cleanupOnce() {
 		if !req.ApprovedAt.IsZero() && now.After(req.GrantedUntil.Add(10*time.Minute)) {
 			delete(a.pending, id)
 		}
-	}
-	a.mu.Unlock()
-	if err := a.cleanupExpiredGrants(now.Unix()); err != nil {
-		log.Printf("local-auth cleanup: %v", err)
 	}
 }
 
