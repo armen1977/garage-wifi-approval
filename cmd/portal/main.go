@@ -290,6 +290,9 @@ func (a *app) grant(req request) (time.Time, error) {
 	if !macRE.MatchString(req.MAC) {
 		return time.Time{}, errors.New("device MAC is required")
 	}
+	if err := a.revokeLocalAuth(req.MAC); err != nil {
+		return time.Time{}, err
+	}
 	until := time.Now().Add(time.Duration(a.cfg.GrantMinutes) * time.Minute).UTC()
 	comment := fmt.Sprintf("local-auth expires=%d", until.Unix())
 	name := "local-auth-" + strings.ReplaceAll(strings.ToLower(req.MAC), ":", "")
@@ -554,6 +557,7 @@ func (a *app) cleanupExpiredGrants(now int64) error {
 	if a.cfg.GaragePassword == "" {
 		return nil
 	}
+	var firstErr error
 	for _, target := range []struct {
 		path       string
 		logRemoval bool
@@ -563,7 +567,10 @@ func (a *app) cleanupExpiredGrants(now int64) error {
 	} {
 		var items []map[string]any
 		if err := a.router.get(target.path, &items); err != nil {
-			return err
+			if firstErr == nil {
+				firstErr = fmt.Errorf("list %s: %w", target.path, err)
+			}
+			continue
 		}
 		for _, item := range items {
 			until, ok := localAuthExpiry(item)
@@ -575,14 +582,54 @@ func (a *app) cleanupExpiredGrants(now int64) error {
 				continue
 			}
 			if err := a.router.delete(target.path + "/" + url.PathEscape(id)); err != nil {
-				return err
+				if firstErr == nil {
+					firstErr = fmt.Errorf("delete %s: %w", target.path, err)
+				}
+				continue
 			}
 			if target.logRemoval {
 				a.logEvent(map[string]any{"type": "access_expired", "client_ip": item["address"], "mac": item["mac-address"], "expires_unix": until})
 			}
 		}
 	}
-	return nil
+	return firstErr
+}
+
+func (a *app) revokeLocalAuth(mac string) error {
+	compactMAC := strings.ReplaceAll(strings.ToLower(mac), ":", "")
+	var firstErr error
+	for _, target := range []struct {
+		path string
+		match func(map[string]any) bool
+	}{
+		{path: "/queue/simple", match: func(item map[string]any) bool {
+			name, _ := item["name"].(string)
+			return name == "local-auth-"+compactMAC
+		}},
+		{path: "/ip/hotspot/ip-binding", match: func(item map[string]any) bool {
+			itemMAC, _ := item["mac-address"].(string)
+			comment, _ := item["comment"].(string)
+			return strings.EqualFold(itemMAC, mac) && strings.HasPrefix(comment, "local-auth expires=")
+		}},
+	} {
+		var items []map[string]any
+		if err := a.router.get(target.path, &items); err != nil {
+			return fmt.Errorf("list %s: %w", target.path, err)
+		}
+		for _, item := range items {
+			if !target.match(item) {
+				continue
+			}
+			id, ok := item[".id"].(string)
+			if !ok || id == "" {
+				continue
+			}
+			if err := a.router.delete(target.path + "/" + url.PathEscape(id)); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("delete %s: %w", target.path, err)
+			}
+		}
+	}
+	return firstErr
 }
 
 func localAuthExpiry(item map[string]any) (int64, bool) {
