@@ -345,6 +345,7 @@ func (a *app) cleanup() {
 	if err := a.cleanupExpiredGrants(time.Now().UTC().Unix()); err != nil {
 		log.Printf("startup local-auth cleanup: %v", err)
 	}
+	a.restoreActiveGrants()
 	a.cleanupPending()
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
@@ -635,15 +636,38 @@ func (a *app) revokeLocalAuth(mac string) error {
 }
 
 func (a *app) expireGrant(req request, until time.Time) {
-	delay := time.Until(until)
-	if delay > 0 {
+	if delay := time.Until(until); delay > 0 {
 		time.Sleep(delay)
 	}
-	if err := a.revokeGrantAt(req.MAC, until.Unix()); err != nil {
-		a.logEvent(map[string]any{"type": "access_expiry_error", "client_ip": req.ClientIP, "mac": req.MAC, "expires_unix": until.Unix(), "error": err.Error()})
+	var lastErr error
+	for attempt := 1; attempt <= 10; attempt++ {
+		if err := a.revokeGrantAt(req.MAC, until.Unix()); err == nil {
+			a.logEvent(map[string]any{"type": "access_expired", "client_ip": req.ClientIP, "mac": req.MAC, "expires_unix": until.Unix()})
+			return
+		} else {
+			lastErr = err
+		}
+		time.Sleep(30 * time.Second)
+	}
+	a.logEvent(map[string]any{"type": "access_expiry_error", "client_ip": req.ClientIP, "mac": req.MAC, "expires_unix": until.Unix(), "error": lastErr.Error()})
+}
+
+func (a *app) restoreActiveGrants() {
+	var items []map[string]any
+	if err := a.router.get("/ip/hotspot/ip-binding", &items); err != nil {
+		log.Printf("restore local-auth grants: %v", err)
 		return
 	}
-	a.logEvent(map[string]any{"type": "access_expired", "client_ip": req.ClientIP, "mac": req.MAC, "expires_unix": until.Unix()})
+	now := time.Now().Unix()
+	for _, item := range items {
+		until, ok := localAuthExpiry(item)
+		mac, _ := item["mac-address"].(string)
+		address, _ := item["address"].(string)
+		if !ok || until <= now || mac == "" || address == "" {
+			continue
+		}
+		go a.expireGrant(request{ClientIP: address, MAC: mac}, time.Unix(until, 0))
+	}
 }
 
 func (a *app) revokeGrantAt(mac string, expiresUnix int64) error {
