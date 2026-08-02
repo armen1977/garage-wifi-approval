@@ -272,6 +272,13 @@ func (a *app) approve(w http.ResponseWriter, r *http.Request) {
 		a.errorPage(w, "Доступ выдать не удалось. SMS-доступ не изменён.")
 		return
 	}
+	if err := a.scheduleGrantExpiry(req, until); err != nil {
+		// Fail closed: never leave an unbounded guest bypass behind.
+		_ = a.revokeGrantAt(req.MAC, until.Unix())
+		a.logEvent(map[string]any{"type": "grant_error", "request_id": id, "client_ip": req.ClientIP, "mac": req.MAC, "order_ref": orderRef, "error": "schedule expiry: " + err.Error()})
+		a.errorPage(w, "Доступ не выдан: не удалось установить время автоматического отключения.")
+		return
+	}
 
 	a.mu.Lock()
 	req.ApprovedAt = time.Now().UTC()
@@ -280,7 +287,6 @@ func (a *app) approve(w http.ResponseWriter, r *http.Request) {
 	a.mu.Unlock()
 	operator, _, _ := r.BasicAuth()
 	a.logEvent(map[string]any{"type": "access_granted", "request_id": id, "client_ip": req.ClientIP, "mac": req.MAC, "order_ref": orderRef, "operator": operator, "expires_utc": until.Format(time.RFC3339), "expires_unix": until.Unix()})
-	go a.expireGrant(req, until)
 	a.page(w, "Готово", fmt.Sprintf("<h1>Готово</h1><p>Доступ открыт на %d минут.</p>", a.cfg.GrantMinutes))
 }
 
@@ -666,8 +672,41 @@ func (a *app) restoreActiveGrants() {
 		if !ok || until <= now || mac == "" || address == "" {
 			continue
 		}
-		go a.expireGrant(request{ClientIP: address, MAC: mac}, time.Unix(until, 0))
+		if err := a.scheduleGrantExpiry(request{ClientIP: address, MAC: mac}, time.Unix(until, 0)); err != nil {
+			log.Printf("restore local-auth expiry for %s: %v", mac, err)
+		}
 	}
+}
+
+func expirySchedulerName(mac string, expiresUnix int64) string {
+	return "expiry-local-" + strings.ReplaceAll(strings.ToLower(mac), ":", "") + "-" + strconv.FormatInt(expiresUnix, 10)
+}
+
+func (a *app) scheduleGrantExpiry(req request, until time.Time) error {
+	name := expirySchedulerName(req.MAC, until.Unix())
+	var existing []map[string]any
+	if err := a.router.get("/system/scheduler", &existing); err != nil {
+		return fmt.Errorf("list scheduler: %w", err)
+	}
+	for _, item := range existing {
+		if itemName, _ := item["name"].(string); itemName == name {
+			return nil
+		}
+	}
+	expires := strconv.FormatInt(until.Unix(), 10)
+	bindingComment := "local-auth expires=" + expires
+	queueComment := bindingComment + " mac=" + req.MAC
+	source := fmt.Sprintf(":foreach i in=[/ip/hotspot/ip-binding/find where comment=%q] do={/ip/hotspot/ip-binding/remove $i};:foreach i in=[/queue/simple/find where comment=%q] do={/queue/simple/remove $i};/system/scheduler/remove [find where name=%q]", bindingComment, queueComment, name)
+	localUntil := until.In(moscowLocation)
+	scheduler := map[string]string{
+		"name": name, "comment": "local-auth expiry mac=" + req.MAC,
+		"start-date": strings.ToLower(localUntil.Format("Jan/02/2006")), "start-time": localUntil.Format("15:04:05"),
+		"interval": "0s", "on-event": source, "policy": "read,write,policy,test",
+	}
+	if err := a.router.put("/system/scheduler", scheduler); err != nil {
+		return fmt.Errorf("create scheduler: %w", err)
+	}
+	return nil
 }
 
 func (a *app) revokeGrantAt(mac string, expiresUnix int64) error {
