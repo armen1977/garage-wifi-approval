@@ -66,6 +66,8 @@ var (
 	moscowLocation = time.FixedZone("Europe/Moscow", 3*60*60)
 )
 
+const approvedGuestAddressList = "garage-guest-approved"
+
 func main() {
 	a := newApp()
 	go a.cleanup()
@@ -286,13 +288,10 @@ func (a *app) approve(w http.ResponseWriter, r *http.Request) {
 		a.errorPage(w, "Доступ выдать не удалось. SMS-доступ не изменён.")
 		return
 	}
-	if err := a.scheduleGrantExpiry(req, until); err != nil {
-		// Fail closed: never leave an unbounded guest bypass behind.
-		_ = a.revokeGrantAt(req.MAC, until.Unix())
-		a.logEvent(map[string]any{"type": "grant_error", "request_id": id, "client_ip": req.ClientIP, "mac": req.MAC, "order_ref": orderRef, "error": "schedule expiry: " + err.Error()})
-		a.errorPage(w, "Доступ не выдан: не удалось установить время автоматического отключения.")
-		return
-	}
+	// RouterOS address-list timeout is the fail-closed expiry boundary. The
+	// goroutine removes the remaining state promptly; a router restart cannot
+	// leave the firewall permission active beyond the approved interval.
+	go a.expireGrant(req, until)
 
 	a.mu.Lock()
 	req.ApprovedAt = time.Now().UTC()
@@ -326,9 +325,28 @@ func (a *app) grant(req request) (time.Time, error) {
 	}
 	binding := map[string]string{"server": a.cfg.HotspotServer, "address": req.ClientIP, "mac-address": req.MAC, "type": "bypassed", "comment": comment}
 	if err := a.router.put("/ip/hotspot/ip-binding", binding); err != nil {
+		_ = a.revokeLocalAuth(req.MAC)
+		return time.Time{}, err
+	}
+	if err := a.addApprovedGuest(req, until, comment); err != nil {
+		_ = a.revokeLocalAuth(req.MAC)
 		return time.Time{}, err
 	}
 	return until, nil
+}
+
+func (a *app) addApprovedGuest(req request, until time.Time, comment string) error {
+	remaining := time.Until(until).Round(time.Second)
+	if remaining <= 0 {
+		return errors.New("grant has already expired")
+	}
+	entry := map[string]string{
+		"list":    approvedGuestAddressList,
+		"address": req.ClientIP,
+		"timeout": fmt.Sprintf("%ds", int64(remaining.Seconds())),
+		"comment": comment + " mac=" + req.MAC,
+	}
+	return a.router.put("/ip/firewall/address-list", entry)
 }
 
 func (a *app) validateHotspotHost(req request) error {
@@ -406,6 +424,9 @@ func (a *app) cleanup() {
 	defer ticker.Stop()
 	for range ticker.C {
 		a.cleanupPending()
+		if err := a.cleanupExpiredGrants(time.Now().UTC().Unix()); err != nil {
+			log.Printf("periodic local-auth cleanup: %v", err)
+		}
 	}
 }
 
@@ -622,6 +643,7 @@ func (a *app) cleanupExpiredGrants(now int64) error {
 	}{
 		{path: "/queue/simple"},
 		{path: "/ip/hotspot/ip-binding", logRemoval: true},
+		{path: "/ip/firewall/address-list"},
 	} {
 		var items []map[string]any
 		if err := a.router.get(target.path, &items); err != nil {
@@ -668,6 +690,10 @@ func (a *app) revokeLocalAuth(mac string) error {
 			itemMAC, _ := item["mac-address"].(string)
 			comment, _ := item["comment"].(string)
 			return strings.EqualFold(itemMAC, mac) && strings.HasPrefix(comment, "local-auth expires=")
+		}},
+		{path: "/ip/firewall/address-list", match: func(item map[string]any) bool {
+			comment, _ := item["comment"].(string)
+			return strings.Contains(comment, "mac="+mac) && strings.HasPrefix(comment, "local-auth expires=")
 		}},
 	} {
 		var items []map[string]any
@@ -721,41 +747,13 @@ func (a *app) restoreActiveGrants() {
 		if !ok || until <= now || mac == "" || address == "" {
 			continue
 		}
-		if err := a.scheduleGrantExpiry(request{ClientIP: address, MAC: mac}, time.Unix(until, 0)); err != nil {
-			log.Printf("restore local-auth expiry for %s: %v", mac, err)
+		req := request{ClientIP: address, MAC: mac}
+		if err := a.addApprovedGuest(req, time.Unix(until, 0), "local-auth expires="+strconv.FormatInt(until, 10)); err != nil {
+			log.Printf("restore local-auth firewall permission for %s: %v", mac, err)
+			continue
 		}
+		go a.expireGrant(req, time.Unix(until, 0))
 	}
-}
-
-func expirySchedulerName(mac string, expiresUnix int64) string {
-	return "expiry-local-" + strings.ReplaceAll(strings.ToLower(mac), ":", "") + "-" + strconv.FormatInt(expiresUnix, 10)
-}
-
-func (a *app) scheduleGrantExpiry(req request, until time.Time) error {
-	name := expirySchedulerName(req.MAC, until.Unix())
-	var existing []map[string]any
-	if err := a.router.get("/system/scheduler", &existing); err != nil {
-		return fmt.Errorf("list scheduler: %w", err)
-	}
-	for _, item := range existing {
-		if itemName, _ := item["name"].(string); itemName == name {
-			return nil
-		}
-	}
-	expires := strconv.FormatInt(until.Unix(), 10)
-	bindingComment := "local-auth expires=" + expires
-	queueComment := bindingComment + " mac=" + req.MAC
-	source := fmt.Sprintf(":foreach i in=[/ip/hotspot/ip-binding/find where comment=%q] do={/ip/hotspot/ip-binding/remove $i};:foreach i in=[/queue/simple/find where comment=%q] do={/queue/simple/remove $i};/system/scheduler/remove [find where name=%q]", bindingComment, queueComment, name)
-	localUntil := until.In(moscowLocation)
-	scheduler := map[string]string{
-		"name": name, "comment": "local-auth expiry mac=" + req.MAC,
-		"start-date": strings.ToLower(localUntil.Format("Jan/02/2006")), "start-time": localUntil.Format("15:04:05"),
-		"interval": "0s", "on-event": source, "policy": "read,write,policy,test",
-	}
-	if err := a.router.put("/system/scheduler", scheduler); err != nil {
-		return fmt.Errorf("create scheduler: %w", err)
-	}
-	return nil
 }
 
 func (a *app) revokeGrantAt(mac string, expiresUnix int64) error {
@@ -774,6 +772,11 @@ func (a *app) revokeGrantAt(mac string, expiresUnix int64) error {
 			itemMAC, _ := item["mac-address"].(string)
 			until, ok := localAuthExpiry(item)
 			return strings.EqualFold(itemMAC, mac) && ok && until == expiresUnix
+		}},
+		{path: "/ip/firewall/address-list", match: func(item map[string]any) bool {
+			comment, _ := item["comment"].(string)
+			until, ok := localAuthExpiry(item)
+			return strings.Contains(comment, "mac="+mac) && ok && until == expiresUnix
 		}},
 	} {
 		var items []map[string]any
