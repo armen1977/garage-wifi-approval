@@ -27,6 +27,6 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/arm
+          platforms: linux/arm/v5
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/garage-wifi-approval:latest
