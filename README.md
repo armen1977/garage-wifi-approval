@@ -11,7 +11,7 @@ binding and `local-auth-*` speed queue.
 ## Safety properties
 
 - The container starts without any guest-facing HotSpot integration.
-- The approval panel is protected by HTTP Basic Auth and an administrator CIDR.
+- The approval panel is protected by HTTP Basic Auth and administrator CIDRs.
 - Requests expire without granting access after ten minutes by default.
 - SMS bindings and queues (`sms-auth`) are never read, deleted, or changed.
 - Logs contain request ID, IP, MAC, order reference, operator and timestamps. Do
@@ -23,6 +23,9 @@ binding and `local-auth-*` speed queue.
 `GARAGE_ROUTER_PASSWORD` and `ADMIN_PASSWORD` must be set before the service can
 approve a request. The router API user should be dedicated to this container and
 restricted to its container IP.
+
+`ADMIN_CIDRS` is a comma-separated list of allowed administrator networks.
+`ADMIN_CIDR` remains supported when a single network is sufficient.
 
 The service is intentionally not deployed by this repository. Deployment is a
 separate, reversible garage-router step after the image and health endpoint have
