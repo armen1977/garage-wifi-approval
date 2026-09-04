@@ -6,7 +6,7 @@ COPY cmd ./cmd
 
 ARG TARGETOS
 ARG TARGETARCH
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/garage-wifi-approval ./cmd/portal
+RUN if [ "$TARGETARCH" = "arm" ]; then export GOARM=5; fi;     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/garage-wifi-approval ./cmd/portal
 
 FROM alpine:3.20 AS certificates
 RUN apk add --no-cache ca-certificates
