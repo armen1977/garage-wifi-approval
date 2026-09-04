@@ -31,7 +31,7 @@ type config struct {
 	RequestTTL                                                                       time.Duration
 	AdminUser, AdminPassword, LogPath                                                string
 	BackupFTPURL, BackupFTPUser, BackupFTPPass, BackupRemoteDir                      string
-	AdminCIDR                                                                        *net.IPNet
+	AdminCIDRs                                                                       []*net.IPNet
 }
 
 type backupStatus struct {
@@ -82,13 +82,12 @@ func main() {
 }
 
 func newApp() *app {
-	_, cidr, _ := net.ParseCIDR(env("ADMIN_CIDR", "192.168.50.0/24"))
 	cfg := config{
 		ListenAddr: env("LISTEN_ADDR", ":8080"), GarageURL: strings.TrimRight(env("GARAGE_ROUTER_URL", "http://192.168.50.1"), "/"),
 		GarageUser: env("GARAGE_ROUTER_USER", "approval-api"), GaragePassword: env("GARAGE_ROUTER_PASSWORD", ""),
 		HotspotServer: env("HOTSPOT_SERVER", "hotspot-guest"), GuestRateLimit: env("GUEST_RATE_LIMIT", "5M/20M"),
 		GrantMinutes: num("GRANT_MINUTES", 60), RequestTTL: time.Duration(num("REQUEST_TTL_SECONDS", 600)) * time.Second,
-		AdminUser: env("ADMIN_USER", "master"), AdminPassword: env("ADMIN_PASSWORD", ""), AdminCIDR: cidr,
+		AdminUser: env("ADMIN_USER", "master"), AdminPassword: env("ADMIN_PASSWORD", ""), AdminCIDRs: adminCIDRs(env("ADMIN_CIDRS", env("ADMIN_CIDR", "192.168.50.0/24"))),
 		LogPath:      env("LOG_PATH", "/data/approval.log"),
 		BackupFTPURL: strings.TrimRight(env("BACKUP_FTP_URL", ""), "/"), BackupFTPUser: env("BACKUP_FTP_USER", "admin"),
 		BackupFTPPass: os.Getenv("BACKUP_FTP_PASSWORD"), BackupRemoteDir: env("BACKUP_REMOTE_DIR", "Garage-WiFi-Logs"),
@@ -99,6 +98,21 @@ func newApp() *app {
 		pending: map[string]request{},
 		backup:  backupStatus{Configured: cfg.BackupFTPURL != ""},
 	}
+}
+
+func adminCIDRs(value string) []*net.IPNet {
+	var cidrs []*net.IPNet
+	for _, raw := range strings.Split(value, ",") {
+		_, cidr, err := net.ParseCIDR(strings.TrimSpace(raw))
+		if err == nil {
+			cidrs = append(cidrs, cidr)
+		}
+	}
+	if len(cidrs) != 0 {
+		return cidrs
+	}
+	_, fallback, _ := net.ParseCIDR("192.168.50.0/24")
+	return []*net.IPNet{fallback}
 }
 
 func env(key, fallback string) string {
@@ -297,6 +311,9 @@ func (a *app) grant(req request) (time.Time, error) {
 	if !macRE.MatchString(req.MAC) {
 		return time.Time{}, errors.New("device MAC is required")
 	}
+	if err := a.validateHotspotHost(req); err != nil {
+		return time.Time{}, err
+	}
 	if err := a.revokeLocalAuth(req.MAC); err != nil {
 		return time.Time{}, err
 	}
@@ -312,6 +329,29 @@ func (a *app) grant(req request) (time.Time, error) {
 		return time.Time{}, err
 	}
 	return until, nil
+}
+
+func (a *app) validateHotspotHost(req request) error {
+	var hosts []map[string]any
+	if err := a.router.get("/ip/hotspot/host", &hosts); err != nil {
+		return fmt.Errorf("list hotspot hosts: %w", err)
+	}
+	for _, host := range hosts {
+		address, _ := host["address"].(string)
+		if address != req.ClientIP {
+			continue
+		}
+		macRaw, _ := host["mac-address"].(string)
+		mac := normalizeMAC(macRaw)
+		if mac == "" {
+			return errors.New("hotspot host MAC is missing")
+		}
+		if !strings.EqualFold(mac, req.MAC) {
+			return errors.New("hotspot host does not match request")
+		}
+		return nil
+	}
+	return errors.New("hotspot host is not active")
 }
 
 func (a *app) bindingActive(req request) (bool, error) {
@@ -333,7 +373,7 @@ func (a *app) bindingActive(req request) (bool, error) {
 
 func (a *app) authorizeAdmin(w http.ResponseWriter, r *http.Request) bool {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil || a.cfg.AdminCIDR == nil || !a.cfg.AdminCIDR.Contains(net.ParseIP(host)) {
+	if err != nil || !a.adminIPAllowed(net.ParseIP(host)) {
 		http.NotFound(w, r)
 		return false
 	}
@@ -344,6 +384,15 @@ func (a *app) authorizeAdmin(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	return true
+}
+
+func (a *app) adminIPAllowed(ip net.IP) bool {
+	for _, cidr := range a.cfg.AdminCIDRs {
+		if cidr != nil && cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *app) cleanup() {
