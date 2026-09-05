@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"html"
@@ -23,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 type config struct {
@@ -32,6 +35,9 @@ type config struct {
 	AdminUser, AdminPassword, LogPath                                                string
 	BackupFTPURL, BackupFTPUser, BackupFTPPass, BackupRemoteDir                      string
 	AdminCIDRs                                                                       []*net.IPNet
+	HiLinkURL, SMSPrefix                                                             string
+	SMSCodeTTL, SMSRetryDelay                                                        time.Duration
+	SMSMaxPerHour, SMSGlobalMaxPerHour                                               int
 }
 
 type backupStatus struct {
@@ -47,13 +53,29 @@ type request struct {
 	ApprovedAt, GrantedUntil time.Time
 }
 
+type smsCode struct {
+	Phone, ClientIP, MAC, Value string
+	ExpiresAt, SentAt           time.Time
+	Attempts, Resends           int
+	Sending                     bool
+}
+
+type rateWindow struct {
+	StartedAt time.Time
+	Count     int
+}
+
 type app struct {
-	cfg      config
-	router   client
-	mu       sync.Mutex
-	pending  map[string]request
-	backupMu sync.RWMutex
-	backup   backupStatus
+	cfg            config
+	router         client
+	hiLink         hiLinkClient
+	mu             sync.Mutex
+	pending        map[string]request
+	codes          map[string]smsCode
+	smsRateLimits  map[string]rateWindow
+	globalSMSLimit rateWindow
+	backupMu       sync.RWMutex
+	backup         backupStatus
 }
 
 type client struct {
@@ -61,8 +83,36 @@ type client struct {
 	http             *http.Client
 }
 
+type hiLinkClient struct {
+	base string
+	http *http.Client
+}
+
+type hiLinkSession struct {
+	Session string `xml:"SesInfo"`
+	Token   string `xml:"TokInfo"`
+}
+
+type hiLinkSMSRequest struct {
+	XMLName  xml.Name `xml:"request"`
+	Index    int      `xml:"Index"`
+	Phones   []string `xml:"Phones>Phone"`
+	Sca      string   `xml:"Sca"`
+	Content  string   `xml:"Content"`
+	Length   int      `xml:"Length"`
+	Reserved int      `xml:"Reserved"`
+	Date     string   `xml:"Date"`
+}
+
+type hiLinkSMSResponse struct {
+	Value string `xml:",chardata"`
+	Code  string `xml:"code"`
+}
+
 var (
 	macRE          = regexp.MustCompile(`^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$`)
+	phoneRE        = regexp.MustCompile(`^\+[1-9][0-9]{9,14}$`)
+	smsCodeRE      = regexp.MustCompile(`^[0-9]{6}$`)
 	moscowLocation = time.FixedZone("Europe/Moscow", 3*60*60)
 )
 
@@ -80,6 +130,10 @@ func main() {
 	mux.HandleFunc("/status", a.status)
 	mux.HandleFunc("/admin", a.admin)
 	mux.HandleFunc("/approve", a.approve)
+	mux.HandleFunc("/sms", a.sms)
+	mux.HandleFunc("/sms/start", a.smsStart)
+	mux.HandleFunc("/sms/resend", a.smsResend)
+	mux.HandleFunc("/sms/verify", a.smsVerify)
 	log.Fatal(http.ListenAndServe(a.cfg.ListenAddr, mux))
 }
 
@@ -93,12 +147,21 @@ func newApp() *app {
 		LogPath:      env("LOG_PATH", "/data/approval.log"),
 		BackupFTPURL: strings.TrimRight(env("BACKUP_FTP_URL", ""), "/"), BackupFTPUser: env("BACKUP_FTP_USER", "admin"),
 		BackupFTPPass: os.Getenv("BACKUP_FTP_PASSWORD"), BackupRemoteDir: env("BACKUP_REMOTE_DIR", "Garage-WiFi-Logs"),
+		HiLinkURL:           strings.TrimRight(env("HILINK_URL", ""), "/"),
+		SMSPrefix:           env("SMS_MESSAGE_PREFIX", "Garage Wi-Fi code: "),
+		SMSCodeTTL:          time.Duration(num("SMS_CODE_TTL_SECONDS", 300)) * time.Second,
+		SMSRetryDelay:       time.Duration(num("SMS_RETRY_DELAY_SECONDS", 120)) * time.Second,
+		SMSMaxPerHour:       num("SMS_MAX_PER_HOUR", 2),
+		SMSGlobalMaxPerHour: num("SMS_GLOBAL_MAX_PER_HOUR", 20),
 	}
 	return &app{
-		cfg:     cfg,
-		router:  client{base: cfg.GarageURL, user: cfg.GarageUser, pass: cfg.GaragePassword, http: &http.Client{Timeout: 12 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}},
-		pending: map[string]request{},
-		backup:  backupStatus{Configured: cfg.BackupFTPURL != ""},
+		cfg:           cfg,
+		router:        client{base: cfg.GarageURL, user: cfg.GarageUser, pass: cfg.GaragePassword, http: &http.Client{Timeout: 12 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}},
+		hiLink:        hiLinkClient{base: cfg.HiLinkURL, http: &http.Client{Timeout: 20 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}},
+		pending:       map[string]request{},
+		codes:         map[string]smsCode{},
+		smsRateLimits: map[string]rateWindow{},
+		backup:        backupStatus{Configured: cfg.BackupFTPURL != ""},
 	}
 }
 
@@ -152,7 +215,165 @@ func (a *app) home(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ip, mac := formContext(r)
-	a.page(w, "Гостевой Wi-Fi", fmt.Sprintf(`<h1>Гостевой Wi-Fi</h1><p>Отправьте заявку мастеру. Доступ будет открыт после подтверждения.</p><form method="post" action="/request"><input type="hidden" name="client_ip" value="%s"><input type="hidden" name="mac" value="%s"><button>Запросить доступ</button></form>`, html.EscapeString(ip), html.EscapeString(mac)))
+	smsURL := "/sms?client_ip=" + url.QueryEscape(ip) + "&mac=" + url.QueryEscape(mac)
+	a.page(w, "Гостевой Wi-Fi", fmt.Sprintf(`<h1>Гостевой Wi-Fi</h1><p>Выберите способ входа.</p><form method="post" action="/request"><input type="hidden" name="client_ip" value="%s"><input type="hidden" name="mac" value="%s"><button>Запросить доступ у мастера</button></form><p><a href="%s">Войти по SMS-коду</a></p>`, html.EscapeString(ip), html.EscapeString(mac), html.EscapeString(smsURL)))
+}
+
+func (a *app) sms(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	if a.cfg.HiLinkURL == "" {
+		a.errorPage(w, "SMS-вход временно недоступен.")
+		return
+	}
+	ip, mac := formContext(r)
+	if !validIP(ip) || !macRE.MatchString(mac) {
+		a.errorPage(w, "Не удалось определить устройство. Подключитесь к Garage-Guest заново.")
+		return
+	}
+	a.page(w, "SMS-код", fmt.Sprintf(`<h1>Вход по SMS-коду</h1><p>Введите номер телефона в международном формате.</p><form method="post" action="/sms/start"><input type="hidden" name="client_ip" value="%s"><input type="hidden" name="mac" value="%s"><input name="phone" inputmode="tel" autocomplete="tel" placeholder="+7XXXXXXXXXX" required><button>Получить SMS-код</button></form><p><a href="/?client_ip=%s&mac=%s">Запросить доступ у мастера</a></p>`, html.EscapeString(ip), html.EscapeString(mac), url.QueryEscape(ip), url.QueryEscape(mac)))
+}
+
+func (a *app) smsStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	_ = r.ParseForm()
+	ip, mac := formContext(r)
+	phone := strings.TrimSpace(r.FormValue("phone"))
+	if !validIP(ip) || !macRE.MatchString(mac) {
+		a.errorPage(w, "Не удалось определить устройство. Подключитесь к Garage-Guest заново.")
+		return
+	}
+	if !phoneRE.MatchString(phone) {
+		a.errorPage(w, "Введите номер в международном формате, например +7XXXXXXXXXX.")
+		return
+	}
+	req := request{ClientIP: ip, MAC: mac}
+	active, err := a.bindingActive(req)
+	if err != nil {
+		a.errorPage(w, "Состояние доступа временно не удалось проверить. Попробуйте ещё раз.")
+		return
+	}
+	if active {
+		a.page(w, "Доступ уже открыт", "<h1>Доступ уже открыт</h1><p>Повторный SMS-код не нужен.</p>")
+		return
+	}
+	state, err := a.createOrResendSMSCode(req, phone)
+	if err != nil {
+		a.errorPage(w, err.Error())
+		return
+	}
+	a.renderSMSVerify(w, req, phone, state)
+}
+
+func (a *app) smsResend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	_ = r.ParseForm()
+	ip, mac := formContext(r)
+	if !validIP(ip) || !macRE.MatchString(mac) {
+		a.errorPage(w, "Не удалось определить устройство. Подключитесь к Garage-Guest заново.")
+		return
+	}
+	req := request{ClientIP: ip, MAC: mac}
+	a.mu.Lock()
+	state, ok := a.codes[smsKey(req)]
+	a.mu.Unlock()
+	if !ok || time.Now().After(state.ExpiresAt) {
+		a.errorPage(w, "SMS-код не найден или истёк. Получите новый код.")
+		return
+	}
+	state, err := a.createOrResendSMSCode(req, state.Phone)
+	if err != nil {
+		a.errorPage(w, err.Error())
+		return
+	}
+	a.renderSMSVerify(w, req, state.Phone, state)
+}
+
+func (a *app) smsVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	_ = r.ParseForm()
+	ip, mac := formContext(r)
+	code := strings.TrimSpace(r.FormValue("code"))
+	if !validIP(ip) || !macRE.MatchString(mac) {
+		a.errorPage(w, "Не удалось определить устройство. Подключитесь к Garage-Guest заново.")
+		return
+	}
+	if !smsCodeRE.MatchString(code) {
+		a.errorPage(w, "Введите шесть цифр из SMS.")
+		return
+	}
+	req := request{ClientIP: ip, MAC: mac}
+	key := smsKey(req)
+	now := time.Now()
+	a.mu.Lock()
+	state, ok := a.codes[key]
+	if !ok || state.Sending || now.After(state.ExpiresAt) || state.ClientIP != ip || !strings.EqualFold(state.MAC, mac) {
+		if ok && now.After(state.ExpiresAt) {
+			delete(a.codes, key)
+		}
+		a.mu.Unlock()
+		a.errorPage(w, "SMS-код не найден или истёк. Получите новый код.")
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(code), []byte(state.Value)) != 1 {
+		state.Attempts++
+		if state.Attempts >= 5 {
+			delete(a.codes, key)
+		} else {
+			a.codes[key] = state
+		}
+		a.mu.Unlock()
+		a.logEvent(map[string]any{"type": "sms_bad_code", "client_ip": ip, "mac": mac})
+		if state.Attempts >= 5 {
+			a.errorPage(w, "Слишком много неверных попыток. Получите новый код.")
+			return
+		}
+		a.renderSMSVerify(w, req, state.Phone, state)
+		return
+	}
+	state.Sending = true
+	a.codes[key] = state
+	a.mu.Unlock()
+
+	until, err := a.grant(req)
+	if err != nil {
+		a.mu.Lock()
+		if current, found := a.codes[key]; found {
+			current.Sending = false
+			a.codes[key] = current
+		}
+		a.mu.Unlock()
+		a.logEvent(map[string]any{"type": "sms_grant_error", "client_ip": ip, "mac": mac, "error": err.Error()})
+		a.errorPage(w, "Доступ выдать не удалось. Повторите ввод кода через несколько секунд.")
+		return
+	}
+	go a.expireGrant(req, until)
+	a.mu.Lock()
+	delete(a.codes, key)
+	a.removePendingFor(req)
+	a.mu.Unlock()
+	a.logEvent(map[string]any{"type": "access_granted", "method": "sms", "client_ip": ip, "mac": mac, "expires_utc": until.Format(time.RFC3339), "expires_unix": until.Unix()})
+	a.page(w, "Готово", fmt.Sprintf("<h1>Готово</h1><p>SMS-код принят. Доступ открыт на %d минут.</p>", a.cfg.GrantMinutes))
+}
+
+func (a *app) renderSMSVerify(w http.ResponseWriter, req request, phone string, state smsCode) {
+	masked := maskPhone(phone)
+	remaining := int(time.Until(state.ExpiresAt).Round(time.Second).Seconds())
+	if remaining < 1 {
+		remaining = 1
+	}
+	a.page(w, "SMS-код", fmt.Sprintf(`<h1>Код из SMS</h1><p>Код отправлен на %s. Он действует %d секунд.</p><form method="post" action="/sms/verify"><input type="hidden" name="client_ip" value="%s"><input type="hidden" name="mac" value="%s"><input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="Шесть цифр" required autofocus><button>Подтвердить код</button></form><form method="post" action="/sms/resend"><input type="hidden" name="client_ip" value="%s"><input type="hidden" name="mac" value="%s"><button>Отправить код повторно</button></form>`, html.EscapeString(masked), remaining, html.EscapeString(req.ClientIP), html.EscapeString(req.MAC), html.EscapeString(req.ClientIP), html.EscapeString(req.MAC)))
 }
 
 func (a *app) request(w http.ResponseWriter, r *http.Request) {
@@ -297,6 +518,7 @@ func (a *app) approve(w http.ResponseWriter, r *http.Request) {
 	req.ApprovedAt = time.Now().UTC()
 	req.GrantedUntil = until
 	a.pending[id] = req
+	delete(a.codes, smsKey(req))
 	a.mu.Unlock()
 	operator, _, _ := r.BasicAuth()
 	a.logEvent(map[string]any{"type": "access_granted", "request_id": id, "client_ip": req.ClientIP, "mac": req.MAC, "order_ref": orderRef, "operator": operator, "expires_utc": until.Format(time.RFC3339), "expires_unix": until.Unix()})
@@ -389,6 +611,221 @@ func (a *app) bindingActive(req request) (bool, error) {
 	return false, nil
 }
 
+func (a *app) createOrResendSMSCode(req request, phone string) (smsCode, error) {
+	if a.cfg.HiLinkURL == "" {
+		return smsCode{}, errors.New("SMS-вход временно недоступен")
+	}
+	now := time.Now()
+	key := smsKey(req)
+
+	a.mu.Lock()
+	state, exists := a.codes[key]
+	if exists && now.After(state.ExpiresAt) {
+		delete(a.codes, key)
+		exists = false
+	}
+	if exists {
+		if state.Sending {
+			a.mu.Unlock()
+			return smsCode{}, errors.New("SMS-код уже отправляется. Подождите несколько секунд")
+		}
+		if state.Phone != phone {
+			a.mu.Unlock()
+			return smsCode{}, errors.New("Для этого устройства уже отправлен SMS-код. Используйте его или дождитесь окончания срока")
+		}
+		if now.Sub(state.SentAt) < a.cfg.SMSRetryDelay {
+			wait := int((a.cfg.SMSRetryDelay - now.Sub(state.SentAt)).Round(time.Second).Seconds())
+			a.mu.Unlock()
+			return smsCode{}, fmt.Errorf("повторную отправку можно запросить через %d секунд", wait)
+		}
+		if state.Resends >= 1 {
+			a.mu.Unlock()
+			return smsCode{}, errors.New("повторная отправка уже использована. Получите новый код после окончания срока")
+		}
+		if !a.reserveSMSLocked(req, phone, now) {
+			a.mu.Unlock()
+			return smsCode{}, errors.New("лимит SMS для устройства или номера исчерпан. Попробуйте позже")
+		}
+		state.Sending = true
+		a.codes[key] = state
+		a.mu.Unlock()
+
+		if err := a.sendSMS(phone, state.Value); err != nil {
+			a.mu.Lock()
+			state.Sending = false
+			a.codes[key] = state
+			a.releaseSMSLocked(req, phone)
+			a.mu.Unlock()
+			a.logEvent(map[string]any{"type": "sms_error", "client_ip": req.ClientIP, "mac": req.MAC, "error": err.Error()})
+			return smsCode{}, errors.New("SMS отправить не удалось. Попробуйте ещё раз")
+		}
+		now = time.Now()
+		a.mu.Lock()
+		state.Sending = false
+		state.SentAt = now
+		state.Resends++
+		a.codes[key] = state
+		a.mu.Unlock()
+		a.logEvent(map[string]any{"type": "sms_resent", "client_ip": req.ClientIP, "mac": req.MAC})
+		return state, nil
+	}
+
+	code, err := randomSMSCode()
+	if err != nil {
+		a.mu.Unlock()
+		return smsCode{}, errors.New("не удалось создать SMS-код")
+	}
+	if !a.reserveSMSLocked(req, phone, now) {
+		a.mu.Unlock()
+		return smsCode{}, errors.New("лимит SMS для устройства или номера исчерпан. Попробуйте позже")
+	}
+	state = smsCode{Phone: phone, ClientIP: req.ClientIP, MAC: req.MAC, Value: code, ExpiresAt: now.Add(a.cfg.SMSCodeTTL), Sending: true}
+	a.codes[key] = state
+	a.mu.Unlock()
+
+	if err := a.sendSMS(phone, code); err != nil {
+		a.mu.Lock()
+		delete(a.codes, key)
+		a.releaseSMSLocked(req, phone)
+		a.mu.Unlock()
+		a.logEvent(map[string]any{"type": "sms_error", "client_ip": req.ClientIP, "mac": req.MAC, "error": err.Error()})
+		return smsCode{}, errors.New("SMS отправить не удалось. Попробуйте ещё раз")
+	}
+
+	now = time.Now()
+	a.mu.Lock()
+	state.Sending = false
+	state.SentAt = now
+	a.codes[key] = state
+	a.mu.Unlock()
+	a.logEvent(map[string]any{"type": "sms_sent", "client_ip": req.ClientIP, "mac": req.MAC})
+	return state, nil
+}
+
+func (a *app) reserveSMSLocked(req request, phone string, now time.Time) bool {
+	deviceKey := "device:" + strings.ToLower(req.MAC)
+	phoneKey := "phone:" + phone
+	if !rateAvailable(a.smsRateLimits[deviceKey], now, a.cfg.SMSMaxPerHour) || !rateAvailable(a.smsRateLimits[phoneKey], now, a.cfg.SMSMaxPerHour) || !rateAvailable(a.globalSMSLimit, now, a.cfg.SMSGlobalMaxPerHour) {
+		return false
+	}
+	a.smsRateLimits[deviceKey] = incrementRate(a.smsRateLimits[deviceKey], now)
+	a.smsRateLimits[phoneKey] = incrementRate(a.smsRateLimits[phoneKey], now)
+	a.globalSMSLimit = incrementRate(a.globalSMSLimit, now)
+	return true
+}
+
+func (a *app) releaseSMSLocked(req request, phone string) {
+	for _, key := range []string{"device:" + strings.ToLower(req.MAC), "phone:" + phone} {
+		window := a.smsRateLimits[key]
+		if window.Count > 0 {
+			window.Count--
+			a.smsRateLimits[key] = window
+		}
+	}
+	if a.globalSMSLimit.Count > 0 {
+		a.globalSMSLimit.Count--
+	}
+}
+
+func rateAvailable(window rateWindow, now time.Time, limit int) bool {
+	if window.StartedAt.IsZero() || now.Sub(window.StartedAt) >= time.Hour {
+		return true
+	}
+	return window.Count < limit
+}
+
+func incrementRate(window rateWindow, now time.Time) rateWindow {
+	if window.StartedAt.IsZero() || now.Sub(window.StartedAt) >= time.Hour {
+		return rateWindow{StartedAt: now, Count: 1}
+	}
+	window.Count++
+	return window
+}
+
+func (a *app) sendSMS(phone, code string) error {
+	if a.hiLink.base == "" {
+		return errors.New("HILINK_URL is empty")
+	}
+	return a.hiLink.sendSMS(phone, a.cfg.SMSPrefix+code)
+}
+
+func (h hiLinkClient) sendSMS(phone, message string) error {
+	session, err := h.session()
+	if err != nil {
+		return fmt.Errorf("HiLink session: %w", err)
+	}
+	payload, err := xml.Marshal(hiLinkSMSRequest{
+		Index: -1, Phones: []string{phone}, Content: message, Length: utf8.RuneCountInString(message), Reserved: 1,
+		Date: time.Now().In(moscowLocation).Format("2006-01-02 15:04:05"),
+	})
+	if err != nil {
+		return err
+	}
+	httpRequest, err := http.NewRequest(http.MethodPost, h.base+"/api/sms/send-sms", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	httpRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+	httpRequest.Header.Set("X-Requested-With", "XMLHttpRequest")
+	httpRequest.Header.Set("Cookie", session.Session)
+	httpRequest.Header.Set("__RequestVerificationToken", session.Token)
+	response, err := h.http.Do(httpRequest)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("HiLink SMS: %s", response.Status)
+	}
+	var result hiLinkSMSResponse
+	if err := xml.Unmarshal(data, &result); err != nil {
+		return fmt.Errorf("decode HiLink SMS response: %w", err)
+	}
+	if strings.EqualFold(strings.TrimSpace(result.Value), "OK") {
+		return nil
+	}
+	if result.Code != "" {
+		return fmt.Errorf("HiLink SMS rejected with code %s", result.Code)
+	}
+	return errors.New("HiLink SMS returned an unexpected response")
+}
+
+func (h hiLinkClient) session() (hiLinkSession, error) {
+	response, err := h.http.Get(h.base + "/api/webserver/SesTokInfo")
+	if err != nil {
+		return hiLinkSession{}, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return hiLinkSession{}, fmt.Errorf("%s", response.Status)
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+	if err != nil {
+		return hiLinkSession{}, err
+	}
+	var session hiLinkSession
+	if err := xml.Unmarshal(data, &session); err != nil {
+		return hiLinkSession{}, err
+	}
+	if session.Session == "" || session.Token == "" {
+		return hiLinkSession{}, errors.New("session or verification token is missing")
+	}
+	return session, nil
+}
+
+func smsKey(req request) string {
+	return req.ClientIP + "|" + strings.ToLower(req.MAC)
+}
+
+func (a *app) removePendingFor(target request) {
+	for id, req := range a.pending {
+		if req.ApprovedAt.IsZero() && req.ClientIP == target.ClientIP && strings.EqualFold(req.MAC, target.MAC) {
+			delete(a.pending, id)
+		}
+	}
+}
+
 func (a *app) authorizeAdmin(w http.ResponseWriter, r *http.Request) bool {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil || !a.adminIPAllowed(net.ParseIP(host)) {
@@ -442,6 +879,11 @@ func (a *app) cleanupPending() {
 		}
 		if !req.ApprovedAt.IsZero() && now.After(req.GrantedUntil.Add(10*time.Minute)) {
 			delete(a.pending, id)
+		}
+	}
+	for key, state := range a.codes {
+		if now.After(state.ExpiresAt) {
+			delete(a.codes, key)
 		}
 	}
 }
@@ -679,7 +1121,7 @@ func (a *app) revokeLocalAuth(mac string) error {
 	compactMAC := strings.ReplaceAll(strings.ToLower(mac), ":", "")
 	var firstErr error
 	for _, target := range []struct {
-		path string
+		path  string
 		match func(map[string]any) bool
 	}{
 		{path: "/queue/simple", match: func(item map[string]any) bool {
@@ -760,7 +1202,7 @@ func (a *app) revokeGrantAt(mac string, expiresUnix int64) error {
 	compactMAC := strings.ReplaceAll(strings.ToLower(mac), ":", "")
 	var firstErr error
 	for _, target := range []struct {
-		path string
+		path  string
 		match func(map[string]any) bool
 	}{
 		{path: "/queue/simple", match: func(item map[string]any) bool {
@@ -894,6 +1336,21 @@ func randomID() (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("G-%06d", number.Int64()+100000), nil
+}
+
+func randomSMSCode() (string, error) {
+	number, err := rand.Int(rand.Reader, big.NewInt(1000000))
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%06d", number.Int64()), nil
+}
+
+func maskPhone(phone string) string {
+	if len(phone) < 6 {
+		return "SMS"
+	}
+	return phone[:2] + strings.Repeat("*", len(phone)-6) + phone[len(phone)-4:]
 }
 
 func (a *app) logEvent(fields map[string]any) {
