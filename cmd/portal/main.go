@@ -661,7 +661,7 @@ func (a *app) cleanupExpiredGrants(now int64) error {
 			if !ok || id == "" {
 				continue
 			}
-			if err := a.router.delete(target.path + "/" + url.PathEscape(id)); err != nil {
+			if err := a.router.delete(target.path + "/" + id); err != nil {
 				if firstErr == nil {
 					firstErr = fmt.Errorf("delete %s: %w", target.path, err)
 				}
@@ -708,7 +708,7 @@ func (a *app) revokeLocalAuth(mac string) error {
 			if !ok || id == "" {
 				continue
 			}
-			if err := a.router.delete(target.path + "/" + url.PathEscape(id)); err != nil && firstErr == nil {
+			if err := a.router.delete(target.path + "/" + id); err != nil && firstErr == nil {
 				firstErr = fmt.Errorf("delete %s: %w", target.path, err)
 			}
 		}
@@ -791,7 +791,7 @@ func (a *app) revokeGrantAt(mac string, expiresUnix int64) error {
 			if !ok || id == "" {
 				continue
 			}
-			if err := a.router.delete(target.path + "/" + url.PathEscape(id)); err != nil && firstErr == nil {
+			if err := a.router.delete(target.path + "/" + id); err != nil && firstErr == nil {
 				firstErr = fmt.Errorf("delete %s: %w", target.path, err)
 			}
 		}
