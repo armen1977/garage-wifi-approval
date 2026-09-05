@@ -198,3 +198,18 @@ func TestNormalizePhone(t *testing.T) {
 		}
 	}
 }
+
+func TestSMSPagesPreventDuplicateSubmission(t *testing.T) {
+	a := &app{cfg: config{HiLinkURL: "http://192.168.8.1"}}
+	start := httptest.NewRecorder()
+	a.sms(start, httptest.NewRequest(http.MethodGet, "/sms?client_ip=192.168.60.253&mac=AA:BB:CC:DD:EE:FF", nil))
+	if !strings.Contains(start.Body.String(), `class="phone"><span>+7</span>`) || !strings.Contains(start.Body.String(), `textContent='Отправляем...'`) {
+		t.Fatalf("SMS start page is missing the Russian prefix or submission guard: %s", start.Body.String())
+	}
+
+	verify := httptest.NewRecorder()
+	a.renderSMSVerify(verify, request{ClientIP: "192.168.60.253", MAC: "AA:BB:CC:DD:EE:FF"}, "+79281234567", smsCode{ExpiresAt: time.Now().Add(time.Minute)})
+	if !strings.Contains(verify.Body.String(), `textContent='Проверяем...'`) {
+		t.Fatalf("SMS verification page is missing a submission guard: %s", verify.Body.String())
+	}
+}
