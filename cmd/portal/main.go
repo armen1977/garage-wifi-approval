@@ -111,7 +111,6 @@ type hiLinkSMSResponse struct {
 
 var (
 	macRE          = regexp.MustCompile(`^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$`)
-	phoneRE        = regexp.MustCompile(`^\+[1-9][0-9]{9,14}$`)
 	smsCodeRE      = regexp.MustCompile(`^[0-9]{6}$`)
 	moscowLocation = time.FixedZone("Europe/Moscow", 3*60*60)
 )
@@ -232,7 +231,7 @@ func (a *app) sms(w http.ResponseWriter, r *http.Request) {
 		a.errorPage(w, "Не удалось определить устройство. Подключитесь к Garage-Guest заново.")
 		return
 	}
-	a.page(w, "SMS-код", fmt.Sprintf(`<h1>Вход по SMS-коду</h1><p>Введите номер телефона в международном формате.</p><form method="post" action="/sms/start"><input type="hidden" name="client_ip" value="%s"><input type="hidden" name="mac" value="%s"><input name="phone" inputmode="tel" autocomplete="tel" placeholder="+7XXXXXXXXXX" required><button>Получить SMS-код</button></form><p><a href="/?client_ip=%s&mac=%s">Запросить доступ у мастера</a></p>`, html.EscapeString(ip), html.EscapeString(mac), url.QueryEscape(ip), url.QueryEscape(mac)))
+	a.page(w, "SMS-код", fmt.Sprintf(`<h1>Вход по SMS-коду</h1><p>Введите номер телефона.</p><form method="post" action="/sms/start" onsubmit="var b=this.querySelector('button');b.disabled=true;b.textContent='Отправляем...' "><input type="hidden" name="client_ip" value="%s"><input type="hidden" name="mac" value="%s"><input name="phone" type="tel" inputmode="tel" autocomplete="tel-national" value="+7" placeholder="+7 928 123-45-67" required><button>Получить SMS-код</button></form><p><a href="/?client_ip=%s&mac=%s">Запросить доступ у мастера</a></p>`, html.EscapeString(ip), html.EscapeString(mac), url.QueryEscape(ip), url.QueryEscape(mac)))
 }
 
 func (a *app) smsStart(w http.ResponseWriter, r *http.Request) {
@@ -242,13 +241,13 @@ func (a *app) smsStart(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = r.ParseForm()
 	ip, mac := formContext(r)
-	phone := strings.TrimSpace(r.FormValue("phone"))
+	phone := normalizePhone(r.FormValue("phone"))
 	if !validIP(ip) || !macRE.MatchString(mac) {
 		a.errorPage(w, "Не удалось определить устройство. Подключитесь к Garage-Guest заново.")
 		return
 	}
-	if !phoneRE.MatchString(phone) {
-		a.errorPage(w, "Введите номер в международном формате, например +7XXXXXXXXXX.")
+	if phone == "" {
+		a.errorPage(w, "Введите корректный номер телефона.")
 		return
 	}
 	req := request{ClientIP: ip, MAC: mac}
@@ -1329,6 +1328,27 @@ func normalizeMAC(value string) string {
 	return ""
 }
 
+func normalizePhone(value string) string {
+	value = strings.TrimSpace(value)
+	var digits strings.Builder
+	for _, r := range value {
+		if r >= '0' && r <= '9' {
+			digits.WriteRune(r)
+		}
+	}
+	number := digits.String()
+	if strings.HasPrefix(value, "+") && len(number) >= 10 && len(number) <= 15 {
+		return "+" + number
+	}
+	if len(number) == 10 {
+		return "+7" + number
+	}
+	if len(number) == 11 && (number[0] == '7' || number[0] == '8') {
+		return "+7" + number[1:]
+	}
+	return ""
+}
+
 func randomID() (string, error) {
 	number, err := rand.Int(rand.Reader, big.NewInt(900000))
 	if err != nil {
@@ -1383,7 +1403,7 @@ func (a *app) errorPage(w http.ResponseWriter, message string) {
 func (a *app) page(w http.ResponseWriter, title, body string) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = fmt.Fprintf(w, `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>%s</title><style>body{margin:0;background:#f3f4f6;font:17px Arial;color:#111}main{max-width:420px;margin:36px auto;background:#fff;padding:24px;border-radius:10px}input,button{width:100%%;box-sizing:border-box;font-size:17px;padding:13px;margin-top:12px}button{border:0;border-radius:8px;background:#1677ff;color:#fff;font-weight:600;min-height:48px;cursor:pointer}form{margin:0}.actions{display:grid;gap:12px;margin-top:20px}.actions button{margin-top:0}section{border-top:1px solid #ddd;padding:14px 0}</style></head><body><main>%s</main></body></html>`, html.EscapeString(title), body)
+	_, _ = fmt.Fprintf(w, `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>%s</title><style>body{margin:0;background:#f3f4f6;font:17px Arial;color:#111}main{max-width:420px;margin:36px auto;background:#fff;padding:24px;border-radius:10px}input,button{width:100%%;box-sizing:border-box;font-size:17px;padding:13px;margin-top:12px}button{border:0;border-radius:8px;background:#1677ff;color:#fff;font-weight:600;min-height:48px;cursor:pointer}button:disabled{opacity:.65;cursor:wait}form{margin:0}.actions{display:grid;gap:12px;margin-top:20px}.actions button{margin-top:0}section{border-top:1px solid #ddd;padding:14px 0}</style></head><body><main>%s</main></body></html>`, html.EscapeString(title), body)
 }
 
 var _ = io.EOF

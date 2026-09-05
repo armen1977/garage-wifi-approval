@@ -184,3 +184,17 @@ func TestHomeShowsEqualMasterAndSMSButtons(t *testing.T) {
 		t.Fatalf("SMS entry must be a button, not a text link: %s", body)
 	}
 }
+
+func TestNormalizePhone(t *testing.T) {
+	for input, expected := range map[string]string{
+		"9281234567":       "+79281234567",
+		"89281234567":      "+79281234567",
+		"+7 928 123-45-67": "+79281234567",
+		"+447911123456":    "+447911123456",
+		"not a number":     "",
+	} {
+		if actual := normalizePhone(input); actual != expected {
+			t.Fatalf("normalizePhone(%q) = %q, want %q", input, actual, expected)
+		}
+	}
+}
