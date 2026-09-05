@@ -178,6 +178,7 @@ func TestHomeShowsEqualMasterAndSMSButtons(t *testing.T) {
 		`<button>Запросить доступ у мастера</button>`,
 		`<button>Войти по SMS-коду</button>`,
 		`<div class="actions">`,
+		`Срок хранения записей - 365 дней.`,
 	} {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("home page missing %q: %s", expected, body)
