@@ -163,3 +163,24 @@ func TestSMSStartKeepsPhoneOutOfResponse(t *testing.T) {
 		t.Fatalf("code count=%d", len(a.codes))
 	}
 }
+
+func TestHomeShowsEqualMasterAndSMSButtons(t *testing.T) {
+	a := &app{}
+	req := httptest.NewRequest(http.MethodGet, "/?client_ip=192.168.60.253&mac=AA:BB:CC:DD:EE:FF", nil)
+	res := httptest.NewRecorder()
+	a.home(res, req)
+
+	body := res.Body.String()
+	for _, expected := range []string{
+		`<button>Запросить доступ у мастера</button>`,
+		`<button>Войти по SMS-коду</button>`,
+		`<div class="actions">`,
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("home page missing %q: %s", expected, body)
+		}
+	}
+	if strings.Contains(body, `<a href="/sms`) {
+		t.Fatalf("SMS entry must be a button, not a text link: %s", body)
+	}
+}

@@ -215,8 +215,7 @@ func (a *app) home(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ip, mac := formContext(r)
-	smsURL := "/sms?client_ip=" + url.QueryEscape(ip) + "&mac=" + url.QueryEscape(mac)
-	a.page(w, "Гостевой Wi-Fi", fmt.Sprintf(`<h1>Гостевой Wi-Fi</h1><p>Выберите способ входа.</p><form method="post" action="/request"><input type="hidden" name="client_ip" value="%s"><input type="hidden" name="mac" value="%s"><button>Запросить доступ у мастера</button></form><p><a href="%s">Войти по SMS-коду</a></p>`, html.EscapeString(ip), html.EscapeString(mac), html.EscapeString(smsURL)))
+	a.page(w, "Гостевой Wi-Fi", fmt.Sprintf(`<h1>Гостевой Wi-Fi</h1><p>Выберите способ входа.</p><div class="actions"><form method="post" action="/request"><input type="hidden" name="client_ip" value="%s"><input type="hidden" name="mac" value="%s"><button>Запросить доступ у мастера</button></form><form method="get" action="/sms"><input type="hidden" name="client_ip" value="%s"><input type="hidden" name="mac" value="%s"><button>Войти по SMS-коду</button></form></div>`, html.EscapeString(ip), html.EscapeString(mac), html.EscapeString(ip), html.EscapeString(mac)))
 }
 
 func (a *app) sms(w http.ResponseWriter, r *http.Request) {
@@ -1384,7 +1383,7 @@ func (a *app) errorPage(w http.ResponseWriter, message string) {
 func (a *app) page(w http.ResponseWriter, title, body string) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = fmt.Fprintf(w, `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>%s</title><style>body{margin:0;background:#f3f4f6;font:17px Arial;color:#111}main{max-width:420px;margin:36px auto;background:#fff;padding:24px;border-radius:10px}input,button{width:100%%;box-sizing:border-box;font-size:17px;padding:13px;margin-top:12px}button{border:0;border-radius:8px;background:#1677ff;color:#fff}section{border-top:1px solid #ddd;padding:14px 0}</style></head><body><main>%s</main></body></html>`, html.EscapeString(title), body)
+	_, _ = fmt.Fprintf(w, `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>%s</title><style>body{margin:0;background:#f3f4f6;font:17px Arial;color:#111}main{max-width:420px;margin:36px auto;background:#fff;padding:24px;border-radius:10px}input,button{width:100%%;box-sizing:border-box;font-size:17px;padding:13px;margin-top:12px}button{border:0;border-radius:8px;background:#1677ff;color:#fff;font-weight:600;min-height:48px;cursor:pointer}form{margin:0}.actions{display:grid;gap:12px;margin-top:20px}.actions button{margin-top:0}section{border-top:1px solid #ddd;padding:14px 0}</style></head><body><main>%s</main></body></html>`, html.EscapeString(title), body)
 }
 
 var _ = io.EOF
