@@ -267,3 +267,63 @@ func TestReadApprovalLogsKeepsLegacyMonthlyLog(t *testing.T) {
 		t.Fatalf("logs=%+v", logs)
 	}
 }
+
+func TestLocalAuthQuotaAndQueueBytes(t *testing.T) {
+	queue := map[string]any{
+		"comment": "local-auth expires=1788600928 quota=150000000 mac=AA:BB:CC:DD:EE:FF",
+		"bytes":   "120000000/30000000",
+	}
+	quota, ok := localAuthQuota(queue)
+	if !ok || quota != 150000000 {
+		t.Fatalf("quota=%d ok=%v", quota, ok)
+	}
+	used, ok := queueByteTotal(queue["bytes"])
+	if !ok || used != 150000000 {
+		t.Fatalf("used=%d ok=%v", used, ok)
+	}
+	if mac := queueMAC("local-auth-aabbccddeeff"); mac != "AA:BB:CC:DD:EE:FF" {
+		t.Fatalf("mac=%q", mac)
+	}
+}
+
+func TestQueueByteTotalRejectsMalformedCounter(t *testing.T) {
+	for _, value := range []any{"100", "100/not-a-number", 100} {
+		if _, ok := queueByteTotal(value); ok {
+			t.Fatalf("queue bytes %v were accepted", value)
+		}
+	}
+}
+
+func TestCleanupQuotaGrantsRevokesEveryPermission(t *testing.T) {
+	comment := "local-auth expires=1788600928 quota=150000000"
+	deleted := map[string]bool{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deleted[r.URL.Path] = true
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/rest/queue/simple":
+			_, _ = io.WriteString(w, `[{".id":"*1","name":"local-auth-aabbccddeeff","comment":"`+comment+`","bytes":"149000000/1000000"}]`)
+		case "/rest/ip/hotspot/ip-binding":
+			_, _ = io.WriteString(w, `[{".id":"*2","mac-address":"AA:BB:CC:DD:EE:FF","comment":"`+comment+`"}]`)
+		case "/rest/ip/firewall/address-list":
+			_, _ = io.WriteString(w, `[{".id":"*3","comment":"`+comment+` mac=AA:BB:CC:DD:EE:FF"}]`)
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	a := &app{cfg: config{GaragePassword: "secret", LogPath: filepath.Join(t.TempDir(), "approval.log")}, router: client{base: server.URL, http: server.Client()}}
+	if err := a.cleanupQuotaGrants(); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/rest/queue/simple/*1", "/rest/ip/hotspot/ip-binding/*2", "/rest/ip/firewall/address-list/*3"} {
+		if !deleted[path] {
+			t.Fatalf("not deleted: %s", path)
+		}
+	}
+}

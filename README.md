@@ -30,5 +30,13 @@ modem UI. The useful optional settings are `SMS_CODE_TTL_SECONDS` (default `300`
 `SMS_RETRY_DELAY_SECONDS` (default `120`), `SMS_MAX_PER_HOUR` (default `2`) and
 `SMS_GLOBAL_MAX_PER_HOUR` (default `20`).
 
+`GRANT_MINUTES` controls the maximum duration of a successful authorization.
+`GUEST_RATE_LIMIT` is the RouterOS Simple Queue upload/download rate, for example
+`2M/6M`. Set `GUEST_DATA_LIMIT_BYTES` to a positive value to apply a combined
+upload-plus-download cap for each authorization. The cap is stored on the
+corresponding `local-auth` queue, so a container restart does not reset it. A
+quota-reached authorization is revoked using the same HotSpot binding, queue and
+firewall cleanup used for normal expiry.
+
 Deployment is a separate, reversible garage-router step after the image and health
 endpoint have been tested.

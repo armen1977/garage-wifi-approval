@@ -31,6 +31,7 @@ import (
 type config struct {
 	ListenAddr, GarageURL, GarageUser, GaragePassword, HotspotServer, GuestRateLimit string
 	GrantMinutes                                                                     int
+	GuestDataLimitBytes                                                              int64
 	RequestTTL                                                                       time.Duration
 	AdminUser, AdminPassword, LogPath                                                string
 	BackupFTPURL, BackupFTPUser, BackupFTPPass, BackupRemoteDir                      string
@@ -146,8 +147,9 @@ func newApp() *app {
 		ListenAddr: env("LISTEN_ADDR", ":8080"), GarageURL: strings.TrimRight(env("GARAGE_ROUTER_URL", "http://192.168.50.1"), "/"),
 		GarageUser: env("GARAGE_ROUTER_USER", "approval-api"), GaragePassword: env("GARAGE_ROUTER_PASSWORD", ""),
 		HotspotServer: env("HOTSPOT_SERVER", "hotspot-guest"), GuestRateLimit: env("GUEST_RATE_LIMIT", "5M/20M"),
-		GrantMinutes: num("GRANT_MINUTES", 60), RequestTTL: time.Duration(num("REQUEST_TTL_SECONDS", 600)) * time.Second,
-		AdminUser: env("ADMIN_USER", "master"), AdminPassword: env("ADMIN_PASSWORD", ""), AdminCIDRs: adminCIDRs(env("ADMIN_CIDRS", env("ADMIN_CIDR", "192.168.50.0/24"))),
+		GrantMinutes: num("GRANT_MINUTES", 60), GuestDataLimitBytes: num64("GUEST_DATA_LIMIT_BYTES", 0),
+		RequestTTL: time.Duration(num("REQUEST_TTL_SECONDS", 600)) * time.Second,
+		AdminUser:  env("ADMIN_USER", "master"), AdminPassword: env("ADMIN_PASSWORD", ""), AdminCIDRs: adminCIDRs(env("ADMIN_CIDRS", env("ADMIN_CIDR", "192.168.50.0/24"))),
 		LogPath:      env("LOG_PATH", "/data/approval.log"),
 		BackupFTPURL: strings.TrimRight(env("BACKUP_FTP_URL", ""), "/"), BackupFTPUser: env("BACKUP_FTP_USER", "anonymous"),
 		BackupFTPPass: env("BACKUP_FTP_PASSWORD", "anonymous"), BackupRemoteDir: env("BACKUP_REMOTE_DIR", "Garage-WiFi-Logs"),
@@ -195,6 +197,14 @@ func env(key, fallback string) string {
 func num(key string, fallback int) int {
 	value, err := strconv.Atoi(env(key, ""))
 	if err != nil || value < 1 {
+		return fallback
+	}
+	return value
+}
+
+func num64(key string, fallback int64) int64 {
+	value, err := strconv.ParseInt(env(key, ""), 10, 64)
+	if err != nil || value < 0 {
 		return fallback
 	}
 	return value
@@ -549,6 +559,9 @@ func (a *app) grant(req request) (time.Time, error) {
 	}
 	until := time.Now().Add(time.Duration(a.cfg.GrantMinutes) * time.Minute).UTC()
 	comment := fmt.Sprintf("local-auth expires=%d", until.Unix())
+	if a.cfg.GuestDataLimitBytes > 0 {
+		comment += fmt.Sprintf(" quota=%d", a.cfg.GuestDataLimitBytes)
+	}
 	name := "local-auth-" + strings.ReplaceAll(strings.ToLower(req.MAC), ":", "")
 	queue := map[string]string{"name": name, "target": req.ClientIP + "/32", "max-limit": a.cfg.GuestRateLimit, "comment": comment + " mac=" + req.MAC}
 	if err := a.router.put("/queue/simple", queue); err != nil {
@@ -866,12 +879,21 @@ func (a *app) cleanup() {
 	}
 	a.restoreActiveGrants()
 	a.cleanupPending()
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-	for range ticker.C {
-		a.cleanupPending()
-		if err := a.cleanupExpiredGrants(time.Now().UTC().Unix()); err != nil {
-			log.Printf("periodic local-auth cleanup: %v", err)
+	expiryTicker := time.NewTicker(time.Minute)
+	quotaTicker := time.NewTicker(5 * time.Second)
+	defer expiryTicker.Stop()
+	defer quotaTicker.Stop()
+	for {
+		select {
+		case <-expiryTicker.C:
+			a.cleanupPending()
+			if err := a.cleanupExpiredGrants(time.Now().UTC().Unix()); err != nil {
+				log.Printf("periodic local-auth cleanup: %v", err)
+			}
+		case <-quotaTicker.C:
+			if err := a.cleanupQuotaGrants(); err != nil {
+				log.Printf("local-auth quota check: %v", err)
+			}
 		}
 	}
 }
@@ -1263,6 +1285,40 @@ func (a *app) cleanupExpiredGrants(now int64) error {
 	return firstErr
 }
 
+func (a *app) cleanupQuotaGrants() error {
+	if a.cfg.GaragePassword == "" {
+		return nil
+	}
+	var queues []map[string]any
+	if err := a.router.get("/queue/simple", &queues); err != nil {
+		return fmt.Errorf("list simple queues: %w", err)
+	}
+	for _, queue := range queues {
+		name, _ := queue["name"].(string)
+		quota, ok := localAuthQuota(queue)
+		if !strings.HasPrefix(name, "local-auth-") || !ok || quota == 0 {
+			continue
+		}
+		used, ok := queueByteTotal(queue["bytes"])
+		if !ok || used < quota {
+			continue
+		}
+		until, ok := localAuthExpiry(queue)
+		if !ok {
+			continue
+		}
+		mac := queueMAC(name)
+		if mac == "" {
+			continue
+		}
+		if err := a.revokeGrantAt(mac, until); err != nil {
+			return fmt.Errorf("revoke quota-exhausted grant for %s: %w", mac, err)
+		}
+		a.logEvent(map[string]any{"type": "access_quota_reached", "mac": mac, "bytes_used": used, "quota_bytes": quota, "expires_unix": until})
+	}
+	return nil
+}
+
 func (a *app) revokeLocalAuth(mac string) error {
 	compactMAC := strings.ReplaceAll(strings.ToLower(mac), ":", "")
 	var firstErr error
@@ -1399,6 +1455,56 @@ func localAuthExpiry(item map[string]any) (int64, bool) {
 		}
 	}
 	return 0, false
+}
+
+func localAuthQuota(item map[string]any) (uint64, bool) {
+	comment, ok := item["comment"].(string)
+	if !ok || !strings.HasPrefix(comment, "local-auth ") {
+		return 0, false
+	}
+	for _, part := range strings.Fields(comment) {
+		if strings.HasPrefix(part, "quota=") {
+			quota, err := strconv.ParseUint(strings.TrimPrefix(part, "quota="), 10, 64)
+			return quota, err == nil
+		}
+	}
+	return 0, false
+}
+
+func queueByteTotal(value any) (uint64, bool) {
+	raw, ok := value.(string)
+	if !ok {
+		return 0, false
+	}
+	parts := strings.Split(raw, "/")
+	if len(parts) != 2 {
+		return 0, false
+	}
+	var total uint64
+	for _, part := range parts {
+		bytes, err := strconv.ParseUint(part, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		total += bytes
+	}
+	return total, true
+}
+
+func queueMAC(name string) string {
+	compact := strings.TrimPrefix(name, "local-auth-")
+	if len(compact) != 12 {
+		return ""
+	}
+	var parts []string
+	for i := 0; i < len(compact); i += 2 {
+		part := compact[i : i+2]
+		if _, err := strconv.ParseUint(part, 16, 8); err != nil {
+			return ""
+		}
+		parts = append(parts, strings.ToUpper(part))
+	}
+	return strings.Join(parts, ":")
 }
 
 func (c client) put(path string, body any) error {
