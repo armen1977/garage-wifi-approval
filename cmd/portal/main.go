@@ -163,12 +163,24 @@ func newApp() *app {
 	}
 	return &app{
 		cfg:           cfg,
-		router:        client{base: cfg.GarageURL, user: cfg.GarageUser, pass: cfg.GaragePassword, http: &http.Client{Timeout: 12 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}},
+		router:        client{base: cfg.GarageURL, user: cfg.GarageUser, pass: cfg.GaragePassword, http: newRouterHTTPClient()},
 		hiLink:        hiLinkClient{base: cfg.HiLinkURL, http: &http.Client{Timeout: 20 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}},
 		pending:       map[string]request{},
 		codes:         map[string]smsCode{},
 		smsRateLimits: map[string]rateWindow{},
 		backup:        backupStatus{Configured: cfg.BackupFTPURL != "", RetentionDays: cfg.LogRetentionDays},
+	}
+}
+
+func newRouterHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 12 * time.Second,
+		Transport: &http.Transport{
+			MaxConnsPerHost:     1,
+			MaxIdleConns:        1,
+			MaxIdleConnsPerHost: 1,
+			IdleConnTimeout:     30 * time.Second,
+		},
 	}
 }
 
@@ -1523,6 +1535,9 @@ func (c client) put(path string, body any) error {
 		return err
 	}
 	defer response.Body.Close()
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		return err
+	}
 	if response.StatusCode >= 300 {
 		return fmt.Errorf("%s", response.Status)
 	}
@@ -1543,7 +1558,11 @@ func (c client) get(path string, out any) error {
 	if response.StatusCode >= 300 {
 		return fmt.Errorf("%s", response.Status)
 	}
-	return json.NewDecoder(response.Body).Decode(out)
+	if err := json.NewDecoder(response.Body).Decode(out); err != nil {
+		return err
+	}
+	_, err = io.Copy(io.Discard, response.Body)
+	return err
 }
 
 func (c client) delete(path string) error {
@@ -1557,6 +1576,9 @@ func (c client) delete(path string) error {
 		return err
 	}
 	defer response.Body.Close()
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		return err
+	}
 	if response.StatusCode >= 300 {
 		return fmt.Errorf("%s", response.Status)
 	}

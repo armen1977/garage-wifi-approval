@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -85,6 +86,50 @@ func TestDeleteKeepsRouterOSRecordIDUnescaped(t *testing.T) {
 	}
 	if requestURI != "/rest/queue/simple/*A" {
 		t.Fatalf("request URI=%q", requestURI)
+	}
+}
+
+func TestRouterClientReusesOneConnection(t *testing.T) {
+	var mu sync.Mutex
+	connections := map[net.Conn]struct{}{}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			_, _ = io.WriteString(w, `[]`)
+		case http.MethodPut, http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("method=%s", r.Method)
+		}
+	}))
+	server.Config.ConnState = func(conn net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			mu.Lock()
+			connections[conn] = struct{}{}
+			mu.Unlock()
+		}
+	}
+	server.Start()
+	defer server.Close()
+
+	httpClient := newRouterHTTPClient()
+	defer httpClient.CloseIdleConnections()
+	router := client{base: server.URL, http: httpClient}
+	var records []map[string]any
+	if err := router.get("/queue/simple", &records); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if err := router.put("/queue/simple", map[string]string{"name": "test"}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := router.delete("/queue/simple/*1"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	mu.Lock()
+	count := len(connections)
+	mu.Unlock()
+	if count != 1 {
+		t.Fatalf("connections=%d, want 1", count)
 	}
 }
 
