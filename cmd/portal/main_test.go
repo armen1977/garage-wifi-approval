@@ -133,6 +133,50 @@ func TestRouterClientReusesOneConnection(t *testing.T) {
 	}
 }
 
+func TestQuotaPollingSkipsRouterWithoutActiveGrant(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		http.Error(w, "unexpected router request", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	a := &app{
+		cfg:    config{GaragePassword: "secret", GuestDataLimitBytes: 150000000},
+		router: client{base: server.URL, http: server.Client()},
+	}
+	if err := a.cleanupQuotaGrants(); err != nil {
+		t.Fatalf("cleanupQuotaGrants: %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("router calls=%d, want 0", calls)
+	}
+}
+
+func TestQuotaPollingRunsForActiveGrant(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Path != "/rest/queue/simple" {
+			t.Fatalf("path=%s", r.URL.Path)
+		}
+		_, _ = io.WriteString(w, "[]")
+	}))
+	defer server.Close()
+
+	a := &app{
+		cfg:          config{GaragePassword: "secret", GuestDataLimitBytes: 150000000},
+		router:       client{base: server.URL, http: server.Client()},
+		activeGrants: map[string]int64{"aa:bb:cc:dd:ee:ff": time.Now().Add(time.Minute).Unix()},
+	}
+	if err := a.cleanupQuotaGrants(); err != nil {
+		t.Fatalf("cleanupQuotaGrants: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("router calls=%d, want 1", calls)
+	}
+}
+
 func TestHiLinkSendSMS(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -362,7 +406,11 @@ func TestCleanupQuotaGrantsRevokesEveryPermission(t *testing.T) {
 	}))
 	defer server.Close()
 
-	a := &app{cfg: config{GaragePassword: "secret", LogPath: filepath.Join(t.TempDir(), "approval.log")}, router: client{base: server.URL, http: server.Client()}}
+	a := &app{
+		cfg:          config{GaragePassword: "secret", GuestDataLimitBytes: 150000000, LogPath: filepath.Join(t.TempDir(), "approval.log")},
+		router:       client{base: server.URL, http: server.Client()},
+		activeGrants: map[string]int64{"aa:bb:cc:dd:ee:ff": time.Now().Add(time.Hour).Unix()},
+	}
 	if err := a.cleanupQuotaGrants(); err != nil {
 		t.Fatal(err)
 	}

@@ -77,6 +77,7 @@ type app struct {
 	mu             sync.Mutex
 	pending        map[string]request
 	codes          map[string]smsCode
+	activeGrants   map[string]int64
 	smsRateLimits  map[string]rateWindow
 	globalSMSLimit rateWindow
 	logMu          sync.Mutex
@@ -167,6 +168,7 @@ func newApp() *app {
 		hiLink:        hiLinkClient{base: cfg.HiLinkURL, http: &http.Client{Timeout: 20 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}},
 		pending:       map[string]request{},
 		codes:         map[string]smsCode{},
+		activeGrants:  map[string]int64{},
 		smsRateLimits: map[string]rateWindow{},
 		backup:        backupStatus{Configured: cfg.BackupFTPURL != "", RetentionDays: cfg.LogRetentionDays},
 	}
@@ -588,6 +590,7 @@ func (a *app) grant(req request) (time.Time, error) {
 		_ = a.revokeLocalAuth(req.MAC)
 		return time.Time{}, err
 	}
+	a.trackGrant(req.MAC, until.Unix())
 	return until, nil
 }
 
@@ -891,17 +894,14 @@ func (a *app) cleanup() {
 	}
 	a.restoreActiveGrants()
 	a.cleanupPending()
-	expiryTicker := time.NewTicker(time.Minute)
+	pendingTicker := time.NewTicker(time.Minute)
 	quotaTicker := time.NewTicker(5 * time.Second)
-	defer expiryTicker.Stop()
+	defer pendingTicker.Stop()
 	defer quotaTicker.Stop()
 	for {
 		select {
-		case <-expiryTicker.C:
+		case <-pendingTicker.C:
 			a.cleanupPending()
-			if err := a.cleanupExpiredGrants(time.Now().UTC().Unix()); err != nil {
-				log.Printf("periodic local-auth cleanup: %v", err)
-			}
 		case <-quotaTicker.C:
 			if err := a.cleanupQuotaGrants(); err != nil {
 				log.Printf("local-auth quota check: %v", err)
@@ -1298,7 +1298,7 @@ func (a *app) cleanupExpiredGrants(now int64) error {
 }
 
 func (a *app) cleanupQuotaGrants() error {
-	if a.cfg.GaragePassword == "" {
+	if a.cfg.GaragePassword == "" || !a.hasActiveQuotaGrant(time.Now().Unix()) {
 		return nil
 	}
 	var queues []map[string]any
@@ -1369,6 +1369,9 @@ func (a *app) revokeLocalAuth(mac string) error {
 			}
 		}
 	}
+	if firstErr == nil {
+		a.untrackGrant(mac, 0)
+	}
 	return firstErr
 }
 
@@ -1408,6 +1411,7 @@ func (a *app) restoreActiveGrants() {
 			log.Printf("restore local-auth firewall permission for %s: %v", mac, err)
 			continue
 		}
+		a.trackGrant(mac, until)
 		go a.expireGrant(req, time.Unix(until, 0))
 	}
 }
@@ -1452,7 +1456,44 @@ func (a *app) revokeGrantAt(mac string, expiresUnix int64) error {
 			}
 		}
 	}
+	if firstErr == nil {
+		a.untrackGrant(mac, expiresUnix)
+	}
 	return firstErr
+}
+
+func (a *app) trackGrant(mac string, expiresUnix int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.activeGrants == nil {
+		a.activeGrants = map[string]int64{}
+	}
+	a.activeGrants[strings.ToLower(mac)] = expiresUnix
+}
+
+func (a *app) untrackGrant(mac string, expiresUnix int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	key := strings.ToLower(mac)
+	if current, ok := a.activeGrants[key]; ok && (expiresUnix == 0 || current == expiresUnix) {
+		delete(a.activeGrants, key)
+	}
+}
+
+func (a *app) hasActiveQuotaGrant(now int64) bool {
+	if a.cfg.GuestDataLimitBytes <= 0 {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for mac, expiresUnix := range a.activeGrants {
+		if expiresUnix <= now {
+			delete(a.activeGrants, mac)
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func localAuthExpiry(item map[string]any) (int64, bool) {
