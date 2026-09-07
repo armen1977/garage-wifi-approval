@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -65,7 +66,7 @@ func TestGrantRejectsMismatchedHotspotHost(t *testing.T) {
 		_, _ = w.Write([]byte(`[{"address":"192.168.60.254","mac-address":"AA:BB:CC:DD:EE:FF"}]`))
 	}))
 	defer server.Close()
-	a := &app{cfg: config{GaragePassword: "secret"}, router: client{base: server.URL, http: server.Client()}}
+	a := &app{cfg: config{GaragePassword: "secret"}, interactiveRouter: client{base: server.URL, http: server.Client()}}
 	_, err := a.grant(request{ClientIP: "192.168.60.254", MAC: "11:22:33:44:55:66"})
 	if err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("err=%v", err)
@@ -169,6 +170,40 @@ func TestRouterClientCanReplaceAnIdleConnection(t *testing.T) {
 	}
 }
 
+func TestInteractiveRouterClientDoesNotReuseConnections(t *testing.T) {
+	var mu sync.Mutex
+	connections := map[net.Conn]struct{}{}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	server.Config.ConnState = func(conn net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			mu.Lock()
+			connections[conn] = struct{}{}
+			mu.Unlock()
+		}
+	}
+	server.Start()
+	defer server.Close()
+
+	httpClient := newInteractiveRouterHTTPClient()
+	router := client{base: server.URL, http: httpClient}
+	var records []map[string]any
+	if err := router.get("/queue/simple", &records); err != nil {
+		t.Fatalf("first get: %v", err)
+	}
+	if err := router.get("/queue/simple", &records); err != nil {
+		t.Fatalf("second get: %v", err)
+	}
+
+	mu.Lock()
+	count := len(connections)
+	mu.Unlock()
+	if count != 2 {
+		t.Fatalf("connections=%d, want 2", count)
+	}
+}
+
 func TestQuotaPollingSkipsRouterWithoutActiveGrant(t *testing.T) {
 	calls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -210,6 +245,37 @@ func TestQuotaPollingRunsForActiveGrant(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("router calls=%d, want 1", calls)
+	}
+}
+
+func TestRestoreActiveGrantKeepsQuotaTrackingWhenFirewallEntryExists(t *testing.T) {
+	until := time.Now().Add(time.Hour).Unix()
+	mac := "AA:BB:CC:DD:EE:FF"
+	clientIP := "192.168.60.254"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/rest/ip/hotspot/ip-binding":
+			_, _ = io.WriteString(w, fmt.Sprintf(`[{"address":%q,"mac-address":%q,"type":"bypassed","comment":%q}]`, clientIP, mac, fmt.Sprintf("local-auth expires=%d quota=150000000", until)))
+		case "/rest/ip/firewall/address-list":
+			if r.Method != http.MethodGet {
+				t.Fatalf("address list method=%s, want GET", r.Method)
+			}
+			_, _ = io.WriteString(w, fmt.Sprintf(`[{"list":"garage-guest-approved","address":%q,"comment":%q}]`, clientIP, fmt.Sprintf("local-auth expires=%d quota=150000000 mac=%s", until, mac)))
+		default:
+			t.Fatalf("path=%s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	a := &app{
+		cfg:          config{GuestDataLimitBytes: 150000000},
+		router:       client{base: server.URL, http: server.Client()},
+		activeGrants: map[string]int64{},
+	}
+	a.restoreActiveGrants()
+	if !a.hasActiveQuotaGrant(time.Now().Unix()) {
+		t.Fatal("restored grant is not tracked for quota enforcement")
 	}
 }
 

@@ -71,18 +71,19 @@ type rateWindow struct {
 }
 
 type app struct {
-	cfg            config
-	router         client
-	hiLink         hiLinkClient
-	mu             sync.Mutex
-	pending        map[string]request
-	codes          map[string]smsCode
-	activeGrants   map[string]int64
-	smsRateLimits  map[string]rateWindow
-	globalSMSLimit rateWindow
-	logMu          sync.Mutex
-	backupMu       sync.RWMutex
-	backup         backupStatus
+	cfg               config
+	router            client
+	interactiveRouter client
+	hiLink            hiLinkClient
+	mu                sync.Mutex
+	pending           map[string]request
+	codes             map[string]smsCode
+	activeGrants      map[string]int64
+	smsRateLimits     map[string]rateWindow
+	globalSMSLimit    rateWindow
+	logMu             sync.Mutex
+	backupMu          sync.RWMutex
+	backup            backupStatus
 }
 
 type client struct {
@@ -169,14 +170,15 @@ func newApp() *app {
 		SMSGlobalMaxPerHour: num("SMS_GLOBAL_MAX_PER_HOUR", 20),
 	}
 	return &app{
-		cfg:           cfg,
-		router:        client{base: cfg.GarageURL, user: cfg.GarageUser, pass: cfg.GaragePassword, http: newRouterHTTPClient()},
-		hiLink:        hiLinkClient{base: cfg.HiLinkURL, http: &http.Client{Timeout: 20 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}},
-		pending:       map[string]request{},
-		codes:         map[string]smsCode{},
-		activeGrants:  map[string]int64{},
-		smsRateLimits: map[string]rateWindow{},
-		backup:        backupStatus{Configured: cfg.BackupFTPURL != "", RetentionDays: cfg.LogRetentionDays},
+		cfg:               cfg,
+		router:            client{base: cfg.GarageURL, user: cfg.GarageUser, pass: cfg.GaragePassword, http: newRouterHTTPClient()},
+		interactiveRouter: client{base: cfg.GarageURL, user: cfg.GarageUser, pass: cfg.GaragePassword, http: newInteractiveRouterHTTPClient()},
+		hiLink:            hiLinkClient{base: cfg.HiLinkURL, http: &http.Client{Timeout: 20 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}},
+		pending:           map[string]request{},
+		codes:             map[string]smsCode{},
+		activeGrants:      map[string]int64{},
+		smsRateLimits:     map[string]rateWindow{},
+		backup:            backupStatus{Configured: cfg.BackupFTPURL != "", RetentionDays: cfg.LogRetentionDays},
 	}
 }
 
@@ -191,6 +193,17 @@ func newRouterHTTPClient() *http.Client {
 			MaxIdleConns:        2,
 			MaxIdleConnsPerHost: 2,
 			IdleConnTimeout:     30 * time.Second,
+		},
+	}
+}
+
+func newInteractiveRouterHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 12 * time.Second,
+		Transport: &http.Transport{
+			// A guest grant is interactive. Avoid waiting on a pooled connection
+			// used by quota accounting; each operation gets a short-lived channel.
+			DisableKeepAlives: true,
 		},
 	}
 }
@@ -574,13 +587,11 @@ func (a *app) grant(req request) (time.Time, error) {
 	if !macRE.MatchString(req.MAC) {
 		return time.Time{}, errors.New("device MAC is required")
 	}
-	// Start an interactive grant on a fresh connection. This only closes an
-	// idle keep-alive socket; an in-flight quota check is left untouched.
-	a.router.closeIdleConnections()
-	if err := a.validateHotspotHost(req); err != nil {
+	router := a.interactiveRouter
+	if err := a.validateHotspotHost(router, req); err != nil {
 		return time.Time{}, err
 	}
-	if err := a.revokeLocalAuth(req.MAC); err != nil {
+	if err := a.revokeLocalAuth(router, req.MAC); err != nil {
 		return time.Time{}, err
 	}
 	until := time.Now().Add(time.Duration(a.cfg.GrantMinutes) * time.Minute).UTC()
@@ -590,23 +601,23 @@ func (a *app) grant(req request) (time.Time, error) {
 	}
 	name := "local-auth-" + strings.ReplaceAll(strings.ToLower(req.MAC), ":", "")
 	queue := map[string]string{"name": name, "target": req.ClientIP + "/32", "max-limit": a.cfg.GuestRateLimit, "comment": comment + " mac=" + req.MAC}
-	if err := a.router.put("/queue/simple", queue); err != nil {
+	if err := router.put("/queue/simple", queue); err != nil {
 		return time.Time{}, err
 	}
 	binding := map[string]string{"server": a.cfg.HotspotServer, "address": req.ClientIP, "mac-address": req.MAC, "type": "bypassed", "comment": comment}
-	if err := a.router.put("/ip/hotspot/ip-binding", binding); err != nil {
-		_ = a.revokeLocalAuth(req.MAC)
+	if err := router.put("/ip/hotspot/ip-binding", binding); err != nil {
+		_ = a.revokeLocalAuth(router, req.MAC)
 		return time.Time{}, err
 	}
-	if err := a.addApprovedGuest(req, until, comment); err != nil {
-		_ = a.revokeLocalAuth(req.MAC)
+	if err := a.addApprovedGuest(router, req, until, comment); err != nil {
+		_ = a.revokeLocalAuth(router, req.MAC)
 		return time.Time{}, err
 	}
 	a.trackGrant(req.MAC, until.Unix())
 	return until, nil
 }
 
-func (a *app) addApprovedGuest(req request, until time.Time, comment string) error {
+func (a *app) addApprovedGuest(router client, req request, until time.Time, comment string) error {
 	remaining := time.Until(until).Round(time.Second)
 	if remaining <= 0 {
 		return errors.New("grant has already expired")
@@ -617,12 +628,29 @@ func (a *app) addApprovedGuest(req request, until time.Time, comment string) err
 		"timeout": fmt.Sprintf("%ds", int64(remaining.Seconds())),
 		"comment": comment + " mac=" + req.MAC,
 	}
-	return a.router.put("/ip/firewall/address-list", entry)
+	return router.put("/ip/firewall/address-list", entry)
 }
 
-func (a *app) validateHotspotHost(req request) error {
+func (a *app) ensureApprovedGuest(req request, until time.Time, comment string) error {
+	var items []map[string]any
+	if err := a.router.get("/ip/firewall/address-list", &items); err != nil {
+		return fmt.Errorf("list approved guest addresses: %w", err)
+	}
+	for _, item := range items {
+		list, _ := item["list"].(string)
+		address, _ := item["address"].(string)
+		itemComment, _ := item["comment"].(string)
+		expiresUnix, ok := localAuthExpiry(item)
+		if list == approvedGuestAddressList && address == req.ClientIP && strings.Contains(itemComment, "mac="+req.MAC) && ok && expiresUnix == until.Unix() {
+			return nil
+		}
+	}
+	return a.addApprovedGuest(a.router, req, until, comment)
+}
+
+func (a *app) validateHotspotHost(router client, req request) error {
 	var hosts []map[string]any
-	if err := a.router.get("/ip/hotspot/host", &hosts); err != nil {
+	if err := router.get("/ip/hotspot/host", &hosts); err != nil {
 		return fmt.Errorf("list hotspot hosts: %w", err)
 	}
 	for _, host := range hosts {
@@ -1343,7 +1371,7 @@ func (a *app) cleanupQuotaGrants() error {
 	return nil
 }
 
-func (a *app) revokeLocalAuth(mac string) error {
+func (a *app) revokeLocalAuth(router client, mac string) error {
 	compactMAC := strings.ReplaceAll(strings.ToLower(mac), ":", "")
 	var firstErr error
 	for _, target := range []struct {
@@ -1365,7 +1393,7 @@ func (a *app) revokeLocalAuth(mac string) error {
 		}},
 	} {
 		var items []map[string]any
-		if err := a.router.get(target.path, &items); err != nil {
+		if err := router.get(target.path, &items); err != nil {
 			return fmt.Errorf("list %s: %w", target.path, err)
 		}
 		for _, item := range items {
@@ -1376,7 +1404,7 @@ func (a *app) revokeLocalAuth(mac string) error {
 			if !ok || id == "" {
 				continue
 			}
-			if err := a.router.delete(target.path + "/" + id); err != nil && firstErr == nil {
+			if err := router.delete(target.path + "/" + id); err != nil && firstErr == nil {
 				firstErr = fmt.Errorf("delete %s: %w", target.path, err)
 			}
 		}
@@ -1419,7 +1447,7 @@ func (a *app) restoreActiveGrants() {
 			continue
 		}
 		req := request{ClientIP: address, MAC: mac}
-		if err := a.addApprovedGuest(req, time.Unix(until, 0), "local-auth expires="+strconv.FormatInt(until, 10)); err != nil {
+		if err := a.ensureApprovedGuest(req, time.Unix(until, 0), "local-auth expires="+strconv.FormatInt(until, 10)); err != nil {
 			log.Printf("restore local-auth firewall permission for %s: %v", mac, err)
 			continue
 		}
