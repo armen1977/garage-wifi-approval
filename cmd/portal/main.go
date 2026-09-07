@@ -90,6 +90,12 @@ type client struct {
 	http             *http.Client
 }
 
+func (c client) closeIdleConnections() {
+	if c.http != nil {
+		c.http.CloseIdleConnections()
+	}
+}
+
 type hiLinkClient struct {
 	base string
 	http *http.Client
@@ -178,9 +184,12 @@ func newRouterHTTPClient() *http.Client {
 	return &http.Client{
 		Timeout: 12 * time.Second,
 		Transport: &http.Transport{
-			MaxConnsPerHost:     1,
-			MaxIdleConns:        1,
-			MaxIdleConnsPerHost: 1,
+			// The quota watcher may be querying the router while a master grants
+			// access. Keep both paths bounded, but do not make the master wait for
+			// the watcher to release the only available connection.
+			MaxConnsPerHost:     2,
+			MaxIdleConns:        2,
+			MaxIdleConnsPerHost: 2,
 			IdleConnTimeout:     30 * time.Second,
 		},
 	}
@@ -565,6 +574,9 @@ func (a *app) grant(req request) (time.Time, error) {
 	if !macRE.MatchString(req.MAC) {
 		return time.Time{}, errors.New("device MAC is required")
 	}
+	// Start an interactive grant on a fresh connection. This only closes an
+	// idle keep-alive socket; an in-flight quota check is left untouched.
+	a.router.closeIdleConnections()
 	if err := a.validateHotspotHost(req); err != nil {
 		return time.Time{}, err
 	}

@@ -133,6 +133,42 @@ func TestRouterClientReusesOneConnection(t *testing.T) {
 	}
 }
 
+func TestRouterClientCanReplaceAnIdleConnection(t *testing.T) {
+	var mu sync.Mutex
+	connections := map[net.Conn]struct{}{}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	server.Config.ConnState = func(conn net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			mu.Lock()
+			connections[conn] = struct{}{}
+			mu.Unlock()
+		}
+	}
+	server.Start()
+	defer server.Close()
+
+	httpClient := newRouterHTTPClient()
+	defer httpClient.CloseIdleConnections()
+	router := client{base: server.URL, http: httpClient}
+	var records []map[string]any
+	if err := router.get("/queue/simple", &records); err != nil {
+		t.Fatalf("first get: %v", err)
+	}
+	router.closeIdleConnections()
+	if err := router.get("/queue/simple", &records); err != nil {
+		t.Fatalf("second get: %v", err)
+	}
+
+	mu.Lock()
+	count := len(connections)
+	mu.Unlock()
+	if count != 2 {
+		t.Fatalf("connections=%d, want 2", count)
+	}
+}
+
 func TestQuotaPollingSkipsRouterWithoutActiveGrant(t *testing.T) {
 	calls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
