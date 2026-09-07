@@ -580,7 +580,28 @@ func (a *app) approve(w http.ResponseWriter, r *http.Request) {
 	a.page(w, "Готово", fmt.Sprintf("<h1>Готово</h1><p>Доступ открыт на %d минут.</p>", a.cfg.GrantMinutes))
 }
 
-func (a *app) grant(req request) (time.Time, error) {
+func (a *app) grant(req request) (until time.Time, err error) {
+	startedAt := time.Now()
+	steps := map[string]int64{}
+	defer func() {
+		event := map[string]any{
+			"type":       "grant_timing",
+			"client_ip":  req.ClientIP,
+			"mac":        req.MAC,
+			"elapsed_ms": time.Since(startedAt).Milliseconds(),
+			"steps_ms":   steps,
+		}
+		if err != nil {
+			event["error"] = err.Error()
+		}
+		a.logEvent(event)
+	}()
+	run := func(name string, operation func() error) error {
+		stepStartedAt := time.Now()
+		stepErr := operation()
+		steps[name] = time.Since(stepStartedAt).Milliseconds()
+		return stepErr
+	}
 	if a.cfg.GaragePassword == "" {
 		return time.Time{}, errors.New("GARAGE_ROUTER_PASSWORD is empty")
 	}
@@ -588,28 +609,28 @@ func (a *app) grant(req request) (time.Time, error) {
 		return time.Time{}, errors.New("device MAC is required")
 	}
 	router := a.interactiveRouter
-	if err := a.validateHotspotHost(router, req); err != nil {
+	if err := run("hotspot_host", func() error { return a.validateHotspotHost(router, req) }); err != nil {
 		return time.Time{}, err
 	}
-	if err := a.revokeLocalAuth(router, req.MAC); err != nil {
+	if err := run("cleanup_previous", func() error { return a.revokeLocalAuth(router, req.MAC) }); err != nil {
 		return time.Time{}, err
 	}
-	until := time.Now().Add(time.Duration(a.cfg.GrantMinutes) * time.Minute).UTC()
+	until = time.Now().Add(time.Duration(a.cfg.GrantMinutes) * time.Minute).UTC()
 	comment := fmt.Sprintf("local-auth expires=%d", until.Unix())
 	if a.cfg.GuestDataLimitBytes > 0 {
 		comment += fmt.Sprintf(" quota=%d", a.cfg.GuestDataLimitBytes)
 	}
 	name := "local-auth-" + strings.ReplaceAll(strings.ToLower(req.MAC), ":", "")
 	queue := map[string]string{"name": name, "target": req.ClientIP + "/32", "max-limit": a.cfg.GuestRateLimit, "comment": comment + " mac=" + req.MAC}
-	if err := router.put("/queue/simple", queue); err != nil {
+	if err := run("queue", func() error { return router.put("/queue/simple", queue) }); err != nil {
 		return time.Time{}, err
 	}
 	binding := map[string]string{"server": a.cfg.HotspotServer, "address": req.ClientIP, "mac-address": req.MAC, "type": "bypassed", "comment": comment}
-	if err := router.put("/ip/hotspot/ip-binding", binding); err != nil {
+	if err := run("hotspot_bypass", func() error { return router.put("/ip/hotspot/ip-binding", binding) }); err != nil {
 		_ = a.revokeLocalAuth(router, req.MAC)
 		return time.Time{}, err
 	}
-	if err := a.addApprovedGuest(router, req, until, comment); err != nil {
+	if err := run("firewall_permission", func() error { return a.addApprovedGuest(router, req, until, comment) }); err != nil {
 		_ = a.revokeLocalAuth(router, req.MAC)
 		return time.Time{}, err
 	}
@@ -650,7 +671,8 @@ func (a *app) ensureApprovedGuest(req request, until time.Time, comment string) 
 
 func (a *app) validateHotspotHost(router client, req request) error {
 	var hosts []map[string]any
-	if err := router.get("/ip/hotspot/host", &hosts); err != nil {
+	path := "/ip/hotspot/host?address=" + url.QueryEscape(req.ClientIP) + "&.proplist=.id,address,mac-address"
+	if err := router.get(path, &hosts); err != nil {
 		return fmt.Errorf("list hotspot hosts: %w", err)
 	}
 	for _, host := range hosts {
@@ -1378,16 +1400,16 @@ func (a *app) revokeLocalAuth(router client, mac string) error {
 		path  string
 		match func(map[string]any) bool
 	}{
-		{path: "/queue/simple", match: func(item map[string]any) bool {
+		{path: "/queue/simple?name=" + url.QueryEscape("local-auth-"+compactMAC) + "&.proplist=.id,name", match: func(item map[string]any) bool {
 			name, _ := item["name"].(string)
 			return name == "local-auth-"+compactMAC
 		}},
-		{path: "/ip/hotspot/ip-binding", match: func(item map[string]any) bool {
+		{path: "/ip/hotspot/ip-binding?mac-address=" + url.QueryEscape(mac) + "&.proplist=.id,mac-address,comment", match: func(item map[string]any) bool {
 			itemMAC, _ := item["mac-address"].(string)
 			comment, _ := item["comment"].(string)
 			return strings.EqualFold(itemMAC, mac) && strings.HasPrefix(comment, "local-auth expires=")
 		}},
-		{path: "/ip/firewall/address-list", match: func(item map[string]any) bool {
+		{path: "/ip/firewall/address-list?list=" + url.QueryEscape(approvedGuestAddressList) + "&.proplist=.id,comment", match: func(item map[string]any) bool {
 			comment, _ := item["comment"].(string)
 			return strings.Contains(comment, "mac="+mac) && strings.HasPrefix(comment, "local-auth expires=")
 		}},
